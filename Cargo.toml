@@ -1,0 +1,35 @@
+[package]
+name = "electrodata-io"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Extensible readers for electrochemical and scientific tabular data"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/xingyuwang/electrodata-io"
+readme = "README.md"
+keywords = ["electrochemistry", "csv", "excel", "polars", "scientific"]
+categories = ["science", "parser-implementations"]
+include = ["src/**", "tests/**", "README.md", "CHANGELOG.md", "LICENSE-MIT", "LICENSE-APACHE", "Cargo.toml"]
+
+[features]
+default = ["csv", "excel", "scientific-validation"]
+csv = ["dep:csv", "polars/csv"]
+excel = ["dep:calamine"]
+serde = ["dep:serde", "chrono/serde"]
+scientific-validation = []
+
+[dependencies]
+calamine = { version = "0.36.1", optional = true, default-features = false, features = ["dates"] }
+chrono = { version = "0.4.42", default-features = false, features = ["std"] }
+csv = { version = "1.3.1", optional = true }
+polars = { version = "0.54.4", default-features = false, features = ["fmt"] }
+thiserror = "2.0.17"
+serde = { version = "1.0.228", optional = true, features = ["derive"] }
+
+[dev-dependencies]
+rust_xlsxwriter = "0.97.0"
+tempfile = "3.23.0"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
