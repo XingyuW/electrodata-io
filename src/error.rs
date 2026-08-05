@@ -1,5 +1,6 @@
 //! Error types.
 
+use crate::DetectionResult;
 use crate::formats::FormatId;
 use std::path::PathBuf;
 
@@ -42,11 +43,25 @@ pub enum Error {
         /// Configured minimum confidence.
         threshold: f32,
     },
+    /// No built-in format had adequate evidence for a bounded source preview.
+    #[error("unknown scientific format for {path}: {evidence:?}")]
+    UnknownFormatDetailed {
+        /// Source path.
+        path: PathBuf,
+        /// Evidence collected while probing the source.
+        evidence: Vec<String>,
+    },
     /// Scientific handlers or worksheets were too close to choose safely.
     #[error("ambiguous scientific format: {candidates:?}")]
     AmbiguousFormat {
         /// Leading candidates and their confidence values.
         candidates: Vec<(FormatId, f32)>,
+    },
+    /// Multiple built-in formats had similarly strong content evidence.
+    #[error("ambiguous scientific format detection: {candidates:?}")]
+    AmbiguousDetection {
+        /// Leading scientific-format candidates and their evidence.
+        candidates: Vec<DetectionResult>,
     },
     /// A required table header was not found.
     #[error("header not found")]

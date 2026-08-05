@@ -1,6 +1,6 @@
 use crate::reader::{DataReader, SourceData};
 use crate::source::{ContainerFormat, Probe};
-use crate::{Error, ReadOptions, Result, SheetSelector};
+use crate::{DetectionResult, Error, ReadOptions, Result, SheetSelector};
 use calamine::{Data, Reader, open_workbook_auto};
 use std::path::Path;
 
@@ -9,6 +9,88 @@ struct SheetData {
     rows: Vec<Vec<String>>,
     raw_rows: Vec<String>,
     probe: Probe,
+}
+
+/// Detects a format using the same worksheet selection policy as workbook reads.
+pub(crate) fn detect(
+    reader: &DataReader,
+    path: &Path,
+    container: ContainerFormat,
+    options: &ReadOptions,
+) -> Result<DetectionResult> {
+    let mut workbook = open_workbook_auto(path).map_err(|error| Error::WorkbookOpening {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let names = workbook.sheet_names();
+    let selected_names: Vec<String> = match &options.sheet {
+        SheetSelector::Auto => names,
+        SheetSelector::Name(name) => {
+            if !names.iter().any(|candidate| candidate == name) {
+                return Err(Error::MissingWorksheet(name.clone()));
+            }
+            vec![name.clone()]
+        }
+        SheetSelector::Index(index) => vec![
+            names
+                .get(*index)
+                .cloned()
+                .ok_or_else(|| Error::MissingWorksheet(format!("index {index}")))?,
+        ],
+    };
+    let source_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    let mut candidates = Vec::new();
+    for name in selected_names {
+        let range = workbook
+            .worksheet_range(&name)
+            .map_err(|error| Error::Calamine(error.to_string()))?;
+        if range.is_empty() {
+            continue;
+        }
+        let rows: Vec<Vec<String>> = range
+            .rows()
+            .take(options.probe_rows)
+            .map(|row| row.iter().map(cell_text).collect())
+            .collect();
+        let raw_rows: Vec<String> = rows.iter().map(|row| row.join(",")).collect();
+        let probe = Probe {
+            rows,
+            raw_rows,
+            source_name: source_name.clone(),
+            delimiter: None,
+            container,
+            worksheet_name: Some(name),
+        };
+        if let Ok(result) = reader.detect_probe(path, &probe, options) {
+            candidates.push(result);
+        }
+    }
+    if candidates.is_empty() {
+        return Err(Error::UnknownFormatDetailed {
+            path: path.to_path_buf(),
+            evidence: vec!["no nonempty worksheet matched a supported scientific format".into()],
+        });
+    }
+    candidates.sort_by(|left, right| right.confidence.total_cmp(&left.confidence));
+    if candidates
+        .get(1)
+        .is_some_and(|second| (candidates[0].confidence - second.confidence).abs() < f32::EPSILON)
+    {
+        return Err(Error::AmbiguousDetection {
+            candidates: candidates.into_iter().take(3).collect(),
+        });
+    }
+    candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::UnknownFormatDetailed {
+            path: path.to_path_buf(),
+            evidence: vec!["no worksheet candidates remained after selection".into()],
+        })
 }
 
 pub(crate) fn read(

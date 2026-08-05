@@ -1,4 +1,5 @@
 use super::{DetectedLayout, Detection, FormatHandler, FormatId, numeric, trim_cell};
+use crate::detection::normalize_for_match;
 use crate::{ColumnDescriptor, ColumnRole, HeaderPolicy, Probe, ReadOptions, Unit};
 
 pub(crate) struct RegularXyHandler;
@@ -9,6 +10,16 @@ impl FormatHandler for RegularXyHandler {
     }
 
     fn detect(&self, probe: &Probe, options: &ReadOptions) -> Option<Detection> {
+        if probe.rows.iter().take(20).flatten().any(|cell| {
+            let value = normalize_for_match(cell);
+            value.starts_with("file:")
+                || value.starts_with("data source:")
+                || value.starts_with("instrument model:")
+                || value.contains("open circuit potential")
+                || value.contains("impedance")
+        }) {
+            return None;
+        }
         let nonempty: Vec<(usize, &[String])> = probe
             .rows
             .iter()
@@ -54,8 +65,16 @@ impl FormatHandler for RegularXyHandler {
                 0.86
             } else if shaped_rows >= 2 {
                 0.78
-            } else {
+            } else if candidate_rows.len() > 1 {
+                // There is enough table-like material to dispatch to the
+                // regular parser, which can then report a precise malformed
+                // or ragged-row error.
                 0.70
+            } else {
+                // A single numeric row is structurally compatible, so an
+                // explicit regular reader can accept it, but it is not enough
+                // evidence for automatic selection at the default threshold.
+                0.60
             },
             evidence: vec![
                 "two consistently shaped numeric columns".into(),

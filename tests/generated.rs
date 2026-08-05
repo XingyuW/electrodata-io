@@ -51,7 +51,12 @@ fn numbered_channels_support_one_eight_noncontiguous_and_both_prefixes() {
             .join(",");
         let file = temp_csv(&chi(header, "Unknown metadata row\nFlag X\n", &row));
         let dataset = read(file.path()).unwrap();
-        assert_eq!(dataset.format, FormatId::ChiMultichannelOcpt);
+        let expected = if width == 2 {
+            FormatId::ChiOcpt
+        } else {
+            FormatId::ChiMultichannelOcpt
+        };
+        assert_eq!(dataset.format, expected);
         assert_eq!(dataset.data.width(), width);
         assert!(
             dataset
@@ -196,7 +201,7 @@ fn excel_sheet_selection_auto_explicit_and_ambiguous() {
     workbook.save(&ambiguous_path).unwrap();
     assert!(matches!(
         read(&ambiguous_path),
-        Err(Error::AmbiguousFormat { .. })
+        Err(Error::AmbiguousDetection { .. }) | Err(Error::AmbiguousFormat { .. })
     ));
 }
 

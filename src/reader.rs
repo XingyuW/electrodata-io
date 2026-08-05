@@ -11,7 +11,7 @@ use crate::metadata::{
 use crate::source::csv_source;
 use crate::source::{ContainerFormat, Probe};
 use crate::validation;
-use crate::{ColumnNamePolicy, Dataset, Error, ReadOptions, Result};
+use crate::{ColumnNamePolicy, Dataset, DetectionResult, Error, ReadOptions, Result};
 use chrono::NaiveDateTime;
 use polars::prelude::{Column, DataFrame};
 use std::path::Path;
@@ -63,6 +63,53 @@ impl DataReader {
                 "{container:?}; enable the excel feature"
             ))),
         }
+    }
+
+    /// Detects a built-in scientific format from a bounded source preview.
+    pub fn detect_format(&self, path: impl AsRef<Path>) -> Result<DetectionResult> {
+        let path = path.as_ref();
+        let options = ReadOptions {
+            probe_rows: 160,
+            ..ReadOptions::default()
+        };
+        match container_for(path)? {
+            ContainerFormat::Csv => {
+                #[cfg(feature = "csv")]
+                {
+                    let probe = csv_source::probe(path, options.probe_rows)?;
+                    self.detect_probe(path, &probe, &options)
+                }
+                #[cfg(not(feature = "csv"))]
+                {
+                    let _ = options;
+                    Err(Error::UnsupportedContainer(
+                        "CSV; enable the csv feature".into(),
+                    ))
+                }
+            }
+            #[cfg(feature = "excel")]
+            container => crate::source::excel::detect(self, path, container, &options),
+            #[cfg(not(feature = "excel"))]
+            container => Err(Error::UnsupportedContainer(format!(
+                "{container:?}; enable the excel feature"
+            ))),
+        }
+    }
+
+    pub(crate) fn detect_probe(
+        &self,
+        path: &Path,
+        probe: &Probe,
+        options: &ReadOptions,
+    ) -> Result<DetectionResult> {
+        crate::detection::select(path, self.detections(probe, options), options)
+    }
+
+    pub(crate) fn detections(&self, probe: &Probe, options: &ReadOptions) -> Vec<Detection> {
+        self.handlers
+            .iter()
+            .filter_map(|handler| handler.detect(probe, options))
+            .collect()
     }
 
     pub(crate) fn choose<'a>(
@@ -130,9 +177,9 @@ impl DataReader {
         #[cfg(not(feature = "csv"))]
         {
             let _ = (path, options);
-            return Err(Error::UnsupportedContainer(
+            Err(Error::UnsupportedContainer(
                 "CSV; enable the csv feature".into(),
-            ));
+            ))
         }
         #[cfg(feature = "csv")]
         {

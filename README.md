@@ -19,6 +19,30 @@ println!("{} rows", dataset.data.height());
 # Ok::<(), electrodata_io::Error>(())
 ```
 
+`read` performs bounded, content-based automatic detection before dispatching
+to the direct built-in reader. It does not identify a scientific format from a
+filename. Inspect the decision without loading the full CSV table:
+
+```rust,no_run
+use electrodata_io::{detect_format, read};
+
+let detection = detect_format("measurement.csv")?;
+println!("Detected format: {:?} ({:.0}% confidence)", detection.format, detection.confidence * 100.0);
+let dataset = read("measurement.csv")?;
+println!("{:?}", dataset.data);
+# Ok::<(), electrodata_io::Error>(())
+```
+
+Use explicit selection when a calling application already knows the instrument
+format, has a controlled import workflow, or needs to bypass ambiguity checks:
+
+```rust,no_run
+use electrodata_io::{read_as, ElectroDataFormat};
+
+let dataset = read_as("measurement.csv", ElectroDataFormat::ChiEis)?;
+# Ok::<(), electrodata_io::Error>(())
+```
+
 `Dataset::data` is an ordinary Polars `DataFrame`:
 
 ```rust,no_run
