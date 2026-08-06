@@ -201,7 +201,7 @@ fn excel_sheet_selection_auto_explicit_and_ambiguous() {
     workbook.save(&ambiguous_path).unwrap();
     assert!(matches!(
         read(&ambiguous_path),
-        Err(Error::AmbiguousDetection { .. }) | Err(Error::AmbiguousFormat { .. })
+        Err(Error::AmbiguousWorksheet { .. })
     ));
 }
 

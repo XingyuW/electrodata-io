@@ -902,12 +902,12 @@ fn worksheet_and_detection_errors_retain_context() {
     workbook.save(ambiguous.path()).unwrap();
     let error = detect_format(ambiguous.path()).unwrap_err();
     assert_eq!(error.path(), Some(ambiguous.path()));
-    let Error::AmbiguousDetection { candidates, .. } = error else {
+    let Error::AmbiguousWorksheet { candidates, .. } = error else {
         panic!("expected worksheet ambiguity");
     };
     let worksheets: BTreeSet<_> = candidates
         .iter()
-        .filter_map(|candidate| candidate.worksheet.as_deref())
+        .map(|candidate| candidate.name.as_str())
         .collect();
     assert_eq!(worksheets, BTreeSet::from(["first", "second"]));
 }

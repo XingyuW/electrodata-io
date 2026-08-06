@@ -22,7 +22,10 @@ pub use diagnostics::{
     ColumnMissingCount, Diagnostic, DiagnosticCode, DiagnosticSummary, Diagnostics, RecoveryAction,
     Severity,
 };
-pub use error::{EisSchemaError, Error, ErrorCategory, ErrorContext, Result, UnitErrorContext};
+pub use error::{
+    EisSchemaError, Error, ErrorCategory, ErrorContext, Result, UnitErrorContext,
+    WorksheetCandidate,
+};
 pub use formats::{DetectedLayout, Detection, FormatHandler, FormatId};
 pub use metadata::{
     AcquisitionMetadata, FormulaCacheStatus, FormulaProvenance, Metadata, MetadataValue, Parameter,

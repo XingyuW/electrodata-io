@@ -223,7 +223,7 @@ No existing handler or central dispatch table changes are needed.
 ## Features
 
 - `csv` (default): delimited UTF-8 input
-- `excel` (default): XLSX, XLS, XLSB, and ODS through Calamine
+- `excel` (default): `.xlsx` compatible time-series worksheets through Calamine
 - `scientific-validation` (default): domain diagnostics
 - `serde`: serialization for metadata, options, diagnostics, and schema types;
   `DataFrame` serialization is deliberately independent
@@ -491,9 +491,13 @@ checks.
 
 ## Excel worksheet selection
 
-Calamine reads XLSX, XLS, XLSB, and ODS workbooks. Automatic selection probes
-nonempty eligible sheets and chooses the strongest format candidate. Select a
-sheet explicitly by name or zero-based index:
+`.xlsx` is supported for compatible time-series worksheets. Legacy OLE `.xls`
+is explicitly unsupported and should be converted to `.xlsx` or a delimited
+text format. Automatic selection probes every nonempty worksheet: it selects
+the worksheet only when exactly one is compatible, and otherwise returns a
+structured worksheet ambiguity error. Detection confidence is retained as
+diagnostic evidence but never breaks a worksheet-selection tie. Select a sheet
+explicitly by name or zero-based index:
 
 ```rust,no_run
 use electrodata_io::{read_with_options, ReadOptions, SheetSelector};
@@ -508,15 +512,15 @@ let second = read_with_options("measurements.xlsx", &by_index)?;
 # Ok::<(), electrodata_io::Error>(())
 ```
 
-Automatic selection returns an ambiguity error when multiple worksheets are
-equally plausible. The selected worksheet is recorded in provenance.
+The selected worksheet is recorded in provenance.
 
 ## Feature selection
 
 Available features are:
 
 - `csv`: CSV, TSV, and delimited text input.
-- `excel`: XLSX, XLS, XLSB, and ODS through Calamine.
+- `excel`: `.xlsx` compatible time-series worksheets through Calamine; legacy
+  OLE `.xls` is explicitly unsupported.
 - `scientific-validation`: OCPT and EIS domain diagnostics.
 - `serde`: serialization for metadata, options, diagnostics, and schema types.
 

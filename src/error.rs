@@ -59,6 +59,24 @@ pub struct UnitErrorContext {
     pub source_header: Option<String>,
 }
 
+/// A compatible worksheet considered during automatic workbook selection.
+///
+/// This context keeps worksheet identity separate from the detected scientific
+/// format so callers never need to decode worksheet names from [`FormatId`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorksheetCandidate {
+    /// Worksheet display name.
+    pub name: String,
+    /// Zero-based worksheet index in the workbook.
+    pub index: usize,
+    /// Scientific format detected for this worksheet.
+    pub format: FormatId,
+    /// Detection confidence retained as diagnostic evidence.
+    pub confidence: f32,
+    /// Evidence produced by the selected format detector.
+    pub evidence: Vec<String>,
+}
+
 /// Structured read failure.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -95,6 +113,13 @@ pub enum Error {
     },
     #[error("missing worksheet {worksheet:?} in {path}")]
     MissingWorksheet { path: PathBuf, worksheet: String },
+    #[error("no compatible worksheet in {path}")]
+    NoCompatibleWorksheet { path: PathBuf },
+    #[error("ambiguous compatible worksheets in {path}: {candidates:?}")]
+    AmbiguousWorksheet {
+        path: PathBuf,
+        candidates: Vec<WorksheetCandidate>,
+    },
     #[error(
         "unknown scientific format for {path} (best confidence {best_confidence:.3}, threshold {threshold:.3})"
     )]
@@ -317,6 +342,8 @@ impl Error {
             | Self::UnregisteredFormat(_) => ErrorCategory::Detection,
             Self::WorkbookOpening { .. }
             | Self::MissingWorksheet { .. }
+            | Self::NoCompatibleWorksheet { .. }
+            | Self::AmbiguousWorksheet { .. }
             | Self::Calamine { .. } => ErrorCategory::Worksheet,
             Self::HeaderNotFound
             | Self::AmbiguousHeaderlessSchema { .. }
@@ -354,6 +381,8 @@ impl Error {
             | Self::UnsupportedContainer { path, .. }
             | Self::WorkbookOpening { path, .. }
             | Self::MissingWorksheet { path, .. }
+            | Self::NoCompatibleWorksheet { path, .. }
+            | Self::AmbiguousWorksheet { path, .. }
             | Self::Calamine { path, .. }
             | Self::DelimitedText { path, .. }
             | Self::UnknownFormatDetailed { path, .. }
@@ -426,6 +455,15 @@ impl Error {
             Self::ReadContext { worksheet, .. } => worksheet.as_deref(),
             Self::MissingWorksheet { worksheet, .. } => Some(worksheet),
             Self::UnusableFormula { worksheet, .. } => worksheet.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// All compatible worksheets retained by an ambiguity error.
+    pub fn worksheet_candidates(&self) -> Option<&[WorksheetCandidate]> {
+        match self {
+            Self::AmbiguousWorksheet { candidates, .. } => Some(candidates),
+            Self::ReadContext { source, .. } => source.worksheet_candidates(),
             _ => None,
         }
     }

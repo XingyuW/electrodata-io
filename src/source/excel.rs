@@ -1,15 +1,54 @@
 use crate::reader::{DataReader, FormulaCell, SourceData};
 use crate::source::{ContainerFormat, Probe};
-use crate::{DetectionResult, Error, ReadOptions, Result, SheetSelector};
+use crate::{
+    Detection, DetectionResult, Error, ReadOptions, Result, SheetSelector, WorksheetCandidate,
+};
 use calamine::{Data, Reader, open_workbook_auto};
 use std::path::Path;
 
 struct SheetData {
     name: String,
+    index: usize,
     rows: Vec<Vec<String>>,
     raw_rows: Vec<String>,
     probe: Probe,
     formula_cells: Vec<FormulaCell>,
+}
+
+struct CompatibleWorksheet<T> {
+    candidate: WorksheetCandidate,
+    value: T,
+}
+
+fn resolve_worksheet_candidates<T>(
+    path: &Path,
+    selector: &SheetSelector,
+    mut candidates: Vec<CompatibleWorksheet<T>>,
+) -> Result<T> {
+    match candidates.len() {
+        0 => Err(Error::NoCompatibleWorksheet {
+            path: path.to_path_buf(),
+        }),
+        1 => Ok(candidates.remove(0).value),
+        _ if matches!(selector, SheetSelector::Auto) => Err(Error::AmbiguousWorksheet {
+            path: path.to_path_buf(),
+            candidates: candidates
+                .into_iter()
+                .map(|candidate| candidate.candidate)
+                .collect(),
+        }),
+        _ => Ok(candidates.remove(0).value),
+    }
+}
+
+fn worksheet_candidate(index: usize, name: String, detection: &Detection) -> WorksheetCandidate {
+    WorksheetCandidate {
+        name,
+        index,
+        format: detection.format.clone(),
+        confidence: detection.confidence,
+        evidence: detection.evidence.clone(),
+    }
 }
 
 /// Detects a format using the same worksheet selection policy as workbook reads.
@@ -24,22 +63,24 @@ pub(crate) fn detect(
         source: Box::new(error),
     })?;
     let names = workbook.sheet_names();
-    let selected_names: Vec<String> = match &options.sheet {
-        SheetSelector::Auto => names,
+    let selected_sheets: Vec<(usize, String)> = match &options.sheet {
+        SheetSelector::Auto => names.into_iter().enumerate().collect(),
         SheetSelector::Name(name) => {
-            if !names.iter().any(|candidate| candidate == name) {
-                return Err(Error::MissingWorksheet {
+            let index = names
+                .iter()
+                .position(|candidate| candidate == name)
+                .ok_or_else(|| Error::MissingWorksheet {
                     path: path.to_path_buf(),
                     worksheet: name.clone(),
-                });
-            }
-            vec![name.clone()]
+                })?;
+            vec![(index, name.clone())]
         }
         SheetSelector::Index(index) => {
             vec![
                 names
                     .get(*index)
                     .cloned()
+                    .map(|name| (*index, name))
                     .ok_or_else(|| Error::MissingWorksheet {
                         path: path.to_path_buf(),
                         worksheet: format!("index {index}"),
@@ -53,7 +94,7 @@ pub(crate) fn detect(
         .unwrap_or_default()
         .to_owned();
     let mut candidates = Vec::new();
-    for name in selected_names {
+    for (index, name) in selected_sheets {
         let range = workbook
             .worksheet_range(&name)
             .map_err(|error| Error::Calamine {
@@ -75,36 +116,23 @@ pub(crate) fn detect(
             source_name: source_name.clone(),
             delimiter: None,
             container,
-            worksheet_name: Some(name),
+            worksheet_name: Some(name.clone()),
         };
         if let Ok(mut result) = reader.detect_probe(path, &probe, options) {
             result.worksheet = probe.worksheet_name.clone();
-            candidates.push(result);
+            candidates.push(CompatibleWorksheet {
+                candidate: WorksheetCandidate {
+                    name: name.clone(),
+                    index,
+                    format: result.format.into(),
+                    confidence: result.confidence,
+                    evidence: result.matched_patterns.clone(),
+                },
+                value: result,
+            });
         }
     }
-    if candidates.is_empty() {
-        return Err(Error::UnknownFormatDetailed {
-            path: path.to_path_buf(),
-            evidence: vec!["no nonempty worksheet matched a supported scientific format".into()],
-        });
-    }
-    candidates.sort_by(|left, right| right.confidence.total_cmp(&left.confidence));
-    if candidates
-        .get(1)
-        .is_some_and(|second| (candidates[0].confidence - second.confidence).abs() < f32::EPSILON)
-    {
-        return Err(Error::AmbiguousDetection {
-            path: path.to_path_buf(),
-            candidates: candidates.into_iter().take(3).collect(),
-        });
-    }
-    candidates
-        .into_iter()
-        .next()
-        .ok_or_else(|| Error::UnknownFormatDetailed {
-            path: path.to_path_buf(),
-            evidence: vec!["no worksheet candidates remained after selection".into()],
-        })
+    resolve_worksheet_candidates(path, &options.sheet, candidates)
 }
 
 pub(crate) fn read(
@@ -123,22 +151,24 @@ pub(crate) fn read(
         source: Box::new(error),
     })?;
     let names = workbook.sheet_names();
-    let selected_names: Vec<String> = match &options.sheet {
-        SheetSelector::Auto => names,
+    let selected_sheets: Vec<(usize, String)> = match &options.sheet {
+        SheetSelector::Auto => names.into_iter().enumerate().collect(),
         SheetSelector::Name(name) => {
-            if !names.iter().any(|candidate| candidate == name) {
-                return Err(Error::MissingWorksheet {
+            let index = names
+                .iter()
+                .position(|candidate| candidate == name)
+                .ok_or_else(|| Error::MissingWorksheet {
                     path: path.to_path_buf(),
                     worksheet: name.clone(),
-                });
-            }
-            vec![name.clone()]
+                })?;
+            vec![(index, name.clone())]
         }
         SheetSelector::Index(index) => {
             vec![
                 names
                     .get(*index)
                     .cloned()
+                    .map(|name| (*index, name))
                     .ok_or_else(|| Error::MissingWorksheet {
                         path: path.to_path_buf(),
                         worksheet: format!("index {index}"),
@@ -152,7 +182,7 @@ pub(crate) fn read(
         .unwrap_or_default()
         .to_owned();
     let mut sheets = Vec::new();
-    for name in selected_names {
+    for (index, name) in selected_sheets {
         let range = workbook
             .worksheet_range(&name)
             .map_err(|error| Error::Calamine {
@@ -183,6 +213,7 @@ pub(crate) fn read(
         };
         sheets.push(SheetData {
             name,
+            index,
             rows,
             raw_rows,
             probe,
@@ -190,65 +221,26 @@ pub(crate) fn read(
         });
     }
     if sheets.is_empty() {
+        if matches!(options.sheet, SheetSelector::Auto) {
+            return Err(Error::NoCompatibleWorksheet {
+                path: path.to_path_buf(),
+            });
+        }
         return Err(Error::EmptyData.with_read_context(path, None, None));
-    }
-    if !matches!(options.sheet, SheetSelector::Auto) {
-        let sheet = sheets
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::EmptyData.with_read_context(path, None, None))?;
-        let (handler, detection) = reader.choose(path, &sheet.probe, options)?;
-        return reader.assemble(
-            path,
-            SourceData {
-                probe: sheet.probe,
-                rows: sheet.rows,
-                raw_rows: sheet.raw_rows,
-                diagnostics: Vec::new(),
-                encoding: None,
-                source_sha256,
-                formula_cells: sheet.formula_cells,
-            },
-            handler,
-            detection,
-            options,
-        );
     }
     let mut candidates = Vec::new();
     for sheet in sheets {
-        if let Ok((handler, detection)) = reader.choose(path, &sheet.probe, options) {
-            candidates.push((sheet, handler, detection));
+        match reader.choose(path, &sheet.probe, options) {
+            Ok((handler, detection)) => candidates.push(CompatibleWorksheet {
+                candidate: worksheet_candidate(sheet.index, sheet.name.clone(), &detection),
+                value: (sheet, handler, detection),
+            }),
+            Err(_) if matches!(options.sheet, SheetSelector::Auto) => continue,
+            Err(error) => return Err(error),
         }
     }
-    candidates.sort_by(|left, right| right.2.confidence.total_cmp(&left.2.confidence));
-    if candidates.is_empty() {
-        return Err(Error::UnknownFormat {
-            path: path.to_path_buf(),
-            best_confidence: 0.0,
-            threshold: options.detection_threshold,
-        });
-    }
-    if candidates.get(1).is_some_and(|second| {
-        (candidates[0].2.confidence - second.2.confidence).abs() < f32::EPSILON
-    }) {
-        return Err(Error::AmbiguousFormat {
-            path: path.to_path_buf(),
-            candidates: candidates
-                .iter()
-                .take(3)
-                .map(|(sheet, _, detection)| {
-                    (
-                        crate::FormatId::Custom(format!(
-                            "worksheet:{}:{}",
-                            sheet.name, detection.format
-                        )),
-                        detection.confidence,
-                    )
-                })
-                .collect(),
-        });
-    }
-    let (sheet, handler, detection) = candidates.remove(0);
+    let (sheet, handler, detection) =
+        resolve_worksheet_candidates(path, &options.sheet, candidates)?;
     reader.assemble(
         path,
         SourceData {
