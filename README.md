@@ -1,9 +1,11 @@
 # electrodata-io
 
-`electrodata-io` is a reusable Rust library for reading electrochemical and
-scientific tables into Polars. Storage detection (CSV or Excel) is independent
-from scientific-format detection, and new scientific formats are registered as
-object-safe handlers instead of being added to a central dispatch `match`.
+`electrodata-io` is the canonical input and physical-data representation crate
+for electrochemical and scientific tables. Its primary API is a stable,
+null-aware `Dataset`/`Column` model; callers do not need Polars. Storage
+detection (delimited text or Excel) is independent from scientific-format
+detection, and new scientific formats remain registerable through object-safe
+handlers.
 
 The crate preserves source order, duplicate samples, numeric signs, raw
 metadata, and original headers. It never sorts, deduplicates, resamples,
@@ -12,10 +14,11 @@ interpolates, corrects units, or replaces measured values with derived values.
 ## Basic use
 
 ```rust,no_run
-use electrodata_io::read;
+use electrodata_io::{ColumnRole, read};
 
 let dataset = read("experiment.csv")?;
-println!("{} rows", dataset.data.height());
+println!("kind={:?}", dataset.kind());
+println!("{} rows", dataset.f64_values(&ColumnRole::Time)?.len());
 # Ok::<(), electrodata_io::Error>(())
 ```
 
@@ -29,7 +32,7 @@ use electrodata_io::{detect_format, read};
 let detection = detect_format("measurement.csv")?;
 println!("Detected format: {:?} ({:.0}% confidence)", detection.format, detection.confidence * 100.0);
 let dataset = read("measurement.csv")?;
-println!("{:?}", dataset.data);
+println!("{:?}", dataset.schema);
 # Ok::<(), electrodata_io::Error>(())
 ```
 
@@ -43,14 +46,22 @@ let dataset = read_as("measurement.csv", ElectroDataFormat::ChiEis)?;
 # Ok::<(), electrodata_io::Error>(())
 ```
 
-`Dataset::data` is an ordinary Polars `DataFrame`:
+Canonical columns retain their source names, roles, units, and null-aware
+physical values:
 
 ```rust,no_run
-let dataset = electrodata_io::read("experiment.csv")?;
-let frame = &dataset.data;
-println!("{:?}", frame.schema());
+use electrodata_io::{ColumnRole, read};
+
+let dataset = read("experiment.csv")?;
+let time = dataset.f64_values(&ColumnRole::Time)?;
+let view = dataset.time_series_view()?;
+println!("{} samples, {} measurements", time.len(), view.measurements.len());
+println!("time in seconds: {:?}", view.time_seconds);
 # Ok::<(), electrodata_io::Error>(())
 ```
+
+`Dataset::data` and `Dataset::column_by_role` remain available as Polars
+compatibility/advanced escape hatches, but are not required by ordinary callers.
 
 Typed and raw metadata are both retained:
 
@@ -68,8 +79,8 @@ Semantic accessors are independent of displayed column names:
 ```rust,no_run
 use electrodata_io::ColumnRole;
 let dataset = electrodata_io::read("Multichannel_OCPT.csv")?;
-let time = dataset.column_by_role(&ColumnRole::Time)?;
-let channel_five = dataset.channel(5)?;
+let time = dataset.f64_values(&ColumnRole::Time)?;
+let channel_five = dataset.f64_values(&ColumnRole::MeasurementChannel(5))?;
 # Ok::<(), electrodata_io::Error>(())
 ```
 
@@ -78,12 +89,71 @@ EIS roles preserve the recorded imaginary sign and measured values:
 ```rust,no_run
 use electrodata_io::ColumnRole;
 let dataset = electrodata_io::read("EIS.csv")?;
-let frequency = dataset.column_by_role(&ColumnRole::Frequency)?;
-let z_imaginary = dataset.column_by_role(&ColumnRole::ImpedanceImaginary)?;
+let view = dataset.eis_view()?;
+let frequency = &view.frequency.values;
+let z_imaginary = &view.imaginary.values;
+let magnitude = view.magnitude_values(); // derived only when the source column is absent
 # Ok::<(), electrodata_io::Error>(())
 ```
 
 ## Options
+
+`ReadOptions::new()` is strict. Recovery is explicit and every tolerated issue
+is represented by a source-located diagnostic:
+
+```rust,no_run
+use electrodata_io::{
+    InvalidCellPolicy, InvalidTimePolicy, RaggedRowPolicy, ReadOptions,
+    read_with_options,
+};
+
+let options = ReadOptions::new()
+    .with_invalid_time_policy(InvalidTimePolicy::SkipRow)
+    .with_invalid_cell_policy(InvalidCellPolicy::Null)
+    .with_ragged_row_policy(RaggedRowPolicy::PadNulls);
+let dataset = read_with_options("legacy.dat", &options)?;
+for diagnostic in &dataset.diagnostics {
+    println!("{:?} row={:?}: {}", diagnostic.code, diagnostic.row, diagnostic.message);
+}
+# Ok::<(), electrodata_io::Error>(())
+```
+
+`ReadOptions::compatibility()` selects the complete compatibility profile,
+including preservation of duplicate/nonmonotonic coordinates. No recovery
+sorts, deduplicates, interpolates, changes units, or replaces measured EIS
+fields.
+
+### 0.2 migration
+
+The canonical-read API is planned for `0.2.0`, a breaking minor release in the
+pre-1.0 series. Construct options through builders instead of a public struct
+literal:
+
+```rust
+use electrodata_io::{InvalidCellPolicy, ReadOptions};
+
+let options = ReadOptions::new()
+    .with_invalid_cell_policy(InvalidCellPolicy::Null);
+```
+
+Inspect errors through their stable structured accessors instead of relying on
+the field shape of a particular variant:
+
+```rust,no_run
+let error = electrodata_io::read("measurement.csv").unwrap_err();
+let context = error.context();
+eprintln!("{:?} {:?}:{:?}", context.category, context.row, context.column);
+```
+
+`Error`, `ReadOptions`, and `ColumnRole` are non-exhaustive for downstream
+matching/construction. Safe legacy runtime surfaces remain: the direct built-in
+readers, `Dataset::data`, `Dataset::columns`, `ColumnRole::Phase`, and
+`ColumnRole::PotentialChannel(n)`. Alias variants retain equality semantics but
+not identical Rust pattern or serde representations.
+
+Legacy OLE `.xls` workbooks return a structured `UnsupportedContainer` error.
+Use `.xlsx` for workbook input; text `.dat` files continue to be recognized by
+content rather than extension alone.
 
 Select an Excel worksheet:
 
@@ -332,7 +402,7 @@ use electrodata_io::{read, ColumnRole};
 let dataset = read("EIS.csv")?;
 let frequency = dataset.column_by_role(&ColumnRole::Frequency)?.f64()?;
 let imaginary = dataset.column_by_role(&ColumnRole::ImpedanceImaginary)?.f64()?;
-let phase = dataset.column_by_role(&ColumnRole::Phase)?.f64()?;
+let phase = dataset.column_by_role(&ColumnRole::ImpedancePhase)?.f64()?;
 println!("first frequency: {:?} Hz", frequency.get(0));
 println!("first imaginary impedance: {:?} ohm", imaginary.get(0));
 println!("first phase: {:?} degrees", phase.get(0));

@@ -1,6 +1,6 @@
 use electrodata_io::{
-    ColumnRole, ElectroDataFormat, Error, FormatId, detect_format, read, read_as, read_chi_eis,
-    read_chi_multichannel_ocpt, read_chi_ocpt, read_regular,
+    ColumnRole, ElectroDataFormat, Error, FormatId, ReadOptions, detect_format, read, read_chi_eis,
+    read_chi_multichannel_ocpt, read_chi_ocpt, read_regular, read_with_options,
 };
 use std::path::{Path, PathBuf};
 
@@ -54,8 +54,12 @@ fn supplied_fixtures_detect_and_dispatch_to_equivalent_readers() {
         let path = fixture(name);
         let detection = detect_format(&path).unwrap();
         assert_eq!(detection.format, format, "{name}");
-        let automatic = read(&path).unwrap();
-        let explicit = read_as(&path, format).unwrap();
+        let automatic = read_with_options(&path, &ReadOptions::compatibility()).unwrap();
+        let explicit = read_with_options(
+            &path,
+            &ReadOptions::compatibility().with_format(format.into()),
+        )
+        .unwrap();
         assert_equivalent(&automatic, &explicit);
     }
 }
@@ -123,7 +127,7 @@ fn two_column_numbered_ocpt_is_ocpt_and_preserves_channel_role() {
     );
     let detected = detect_format(file.path()).unwrap();
     assert_eq!(detected.format, ElectroDataFormat::ChiOcpt);
-    let dataset = read(file.path()).unwrap();
+    let dataset = read_with_options(file.path(), &ReadOptions::compatibility()).unwrap();
     assert_eq!(dataset.format, FormatId::ChiOcpt);
     assert_eq!(dataset.columns[1].role, ColumnRole::PotentialChannel(1));
 }
@@ -170,7 +174,7 @@ fn regular_headerless_bom_crlf_and_blank_lines_preserve_the_first_row() {
     let detected = detect_format(file.path()).unwrap();
     assert_eq!(detected.format, ElectroDataFormat::Regular);
     assert_eq!(detected.header_row, None);
-    let dataset = read(file.path()).unwrap();
+    let dataset = read_with_options(file.path(), &ReadOptions::compatibility()).unwrap();
     assert_eq!(dataset.data.height(), 3);
     assert_eq!(
         dataset.data.column("x").unwrap().f64().unwrap().get(0),

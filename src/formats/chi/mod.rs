@@ -1,3 +1,4 @@
+use super::regular_xy::{header_role, header_unit};
 use super::{DetectedLayout, Detection, FormatHandler, FormatId, trim_cell};
 use crate::detection::normalize_for_match;
 use crate::{ColumnDescriptor, ColumnRole, Error, Probe, ReadOptions, Unit};
@@ -124,11 +125,15 @@ impl FormatHandler for ChiOcptHandler {
             .row(detection.layout.header_row.ok_or(Error::HeaderNotFound)?)
             .ok_or(Error::HeaderNotFound)?;
         let potential_role = channel_number(&row[1])
-            .map(ColumnRole::PotentialChannel)
+            .map(ColumnRole::MeasurementChannel)
             .unwrap_or(ColumnRole::Potential);
+        let time_unit = header_unit(&row[0]).unwrap_or(Unit::Unknown);
+        let potential_unit = header_unit(&row[1]).unwrap_or(Unit::Unknown);
+        let time_name = canonical_name("time", &time_unit);
+        let potential_name = canonical_name("potential", &potential_unit);
         Ok(vec![
-            descriptor(&row[0], "time_s", ColumnRole::Time, Unit::Second),
-            descriptor(&row[1], "potential_v", potential_role, Unit::Volt),
+            descriptor(&row[0], &time_name, ColumnRole::Time, time_unit),
+            descriptor(&row[1], &potential_name, potential_role, potential_unit),
         ])
     }
 }
@@ -172,26 +177,28 @@ impl FormatHandler for ChiMultichannelOcptHandler {
         let row = probe
             .row(detection.layout.header_row.ok_or(Error::HeaderNotFound)?)
             .ok_or(Error::HeaderNotFound)?;
+        let time_unit = header_unit(&row[0]).unwrap_or(Unit::Unknown);
         let mut result = vec![descriptor(
             &row[0],
-            "time_s",
+            &canonical_name("time", &time_unit),
             ColumnRole::Time,
-            Unit::Second,
+            time_unit,
         )];
         for value in row.iter().skip(1) {
+            let unit = header_unit(value).unwrap_or(Unit::Unknown);
             if let Some(channel) = channel_number(value) {
                 result.push(descriptor(
                     value,
-                    &format!("ch{channel}_v"),
-                    ColumnRole::PotentialChannel(channel),
-                    Unit::Volt,
+                    &canonical_name(&format!("ch{channel}"), &unit),
+                    ColumnRole::MeasurementChannel(channel),
+                    unit,
                 ));
             } else if is_potential(value) {
                 result.push(descriptor(
                     value,
-                    "potential_v",
+                    &canonical_name("potential", &unit),
                     ColumnRole::Potential,
-                    Unit::Volt,
+                    unit,
                 ));
             } else {
                 return Err(Error::InvalidColumnSignature(value.clone()));
@@ -202,15 +209,43 @@ impl FormatHandler for ChiMultichannelOcptHandler {
 }
 
 fn eis_roles(row: &[String]) -> bool {
-    if row.len() != 5 {
+    if !(3..=5).contains(&row.len()) {
         return false;
     }
-    let values: Vec<String> = row.iter().map(|v| header_key(v)).collect();
-    matches!(values[0].as_str(), "freq/hz" | "frequency/hz")
-        && matches!(values[1].as_str(), "z'/ohm" | "zreal/ohm")
-        && matches!(values[2].as_str(), "z\"/ohm" | "zimag/ohm")
-        && matches!(values[3].as_str(), "z/ohm" | "|z|/ohm")
-        && matches!(values[4].as_str(), "phase/deg" | "phase/degree")
+    let roles: Vec<ColumnRole> = row.iter().map(|value| header_role(value)).collect();
+    let allowed = roles.iter().all(|role| {
+        matches!(
+            role,
+            ColumnRole::Frequency
+                | ColumnRole::ImpedanceReal
+                | ColumnRole::ImpedanceImaginary
+                | ColumnRole::ImpedanceMagnitude
+                | ColumnRole::ImpedancePhase
+        )
+    });
+    allowed
+        && unique_role(&roles, &ColumnRole::Frequency)
+        && roles.iter().any(|role| {
+            matches!(
+                role,
+                ColumnRole::ImpedanceReal
+                    | ColumnRole::ImpedanceImaginary
+                    | ColumnRole::ImpedanceMagnitude
+                    | ColumnRole::ImpedancePhase
+            )
+        })
+        && [
+            ColumnRole::ImpedanceReal,
+            ColumnRole::ImpedanceImaginary,
+            ColumnRole::ImpedanceMagnitude,
+            ColumnRole::ImpedancePhase,
+        ]
+        .iter()
+        .all(|expected| roles.iter().filter(|role| *role == expected).count() <= 1)
+}
+
+fn unique_role(roles: &[ColumnRole], expected: &ColumnRole) -> bool {
+    roles.iter().filter(|role| *role == expected).count() == 1
 }
 
 impl FormatHandler for ChiEisHandler {
@@ -218,21 +253,43 @@ impl FormatHandler for ChiEisHandler {
         FormatId::ChiEis
     }
     fn detect(&self, probe: &Probe, _options: &ReadOptions) -> Option<Detection> {
-        let (_, technique) = technique_row(probe, eis_technique)?;
+        let technique = technique_row(probe, eis_technique).map(|(_, technique)| technique);
         let (header, data) = header_and_data(probe, eis_roles)?;
+        let header_row = probe.row(header)?;
+        let width = header_row.len();
+        let roles: Vec<_> = header_row.iter().map(|value| header_role(value)).collect();
+        let complete = [
+            ColumnRole::Frequency,
+            ColumnRole::ImpedanceReal,
+            ColumnRole::ImpedanceImaginary,
+        ]
+        .iter()
+        .all(|role| unique_role(&roles, role));
         Some(Detection {
             format: FormatId::ChiEis,
-            confidence: eis_confidence(&technique),
+            confidence: match (technique.as_deref(), complete) {
+                (Some(technique), true) => eis_confidence(technique),
+                (Some(_), false) => 0.91,
+                (None, true) => 0.93,
+                (None, false) => 0.89,
+            },
             evidence: vec![
-                format!("EIS technique signature: {technique}"),
-                "frequency, impedance component, magnitude, and phase roles".into(),
+                technique
+                    .map(|value| format!("EIS technique signature: {value}"))
+                    .unwrap_or_else(|| "EIS semantic header without an instrument preamble".into()),
+                if complete {
+                    "frequency and required complex impedance roles resolved independent of position"
+                        .into()
+                } else {
+                    "EIS-like semantic header requires structured required-role validation".into()
+                },
                 format!("matched source header: {}", probe.row(header)?.join(", ")),
             ],
             layout: DetectedLayout {
                 header_row: Some(header),
                 data_start_row: data,
                 metadata_range: Some(0..header),
-                expected_column_count: 5,
+                expected_column_count: width,
                 has_header: true,
             },
         })
@@ -245,18 +302,21 @@ impl FormatHandler for ChiEisHandler {
         let row = probe
             .row(detection.layout.header_row.ok_or(Error::HeaderNotFound)?)
             .ok_or(Error::HeaderNotFound)?;
-        let definitions = [
-            ("frequency_hz", ColumnRole::Frequency, Unit::Hertz),
-            ("z_real_ohm", ColumnRole::ImpedanceReal, Unit::Ohm),
-            ("z_imag_ohm", ColumnRole::ImpedanceImaginary, Unit::Ohm),
-            ("z_magnitude_ohm", ColumnRole::ImpedanceMagnitude, Unit::Ohm),
-            ("phase_deg", ColumnRole::Phase, Unit::Degree),
-        ];
-        Ok(row
-            .iter()
-            .zip(definitions)
-            .map(|(source, (name, role, unit))| descriptor(source, name, role, unit))
-            .collect())
+        row.iter()
+            .map(|source| {
+                let role = header_role(source);
+                let stem = match role {
+                    ColumnRole::Frequency => "frequency",
+                    ColumnRole::ImpedanceReal => "z_real",
+                    ColumnRole::ImpedanceImaginary => "z_imag",
+                    ColumnRole::ImpedanceMagnitude => "z_magnitude",
+                    ColumnRole::ImpedancePhase => "phase",
+                    _ => return Err(Error::InvalidColumnSignature(source.clone())),
+                };
+                let unit = header_unit(source).unwrap_or(Unit::Unknown);
+                Ok(descriptor(source, &canonical_name(stem, &unit), role, unit))
+            })
+            .collect()
     }
 }
 
@@ -324,4 +384,22 @@ fn descriptor(source: &str, canonical: &str, role: ColumnRole, unit: Unit) -> Co
         role,
         unit: Some(unit),
     }
+}
+
+fn canonical_name(stem: &str, unit: &Unit) -> String {
+    let suffix = match unit {
+        Unit::Second => "s",
+        Unit::Hour => "h",
+        Unit::Day => "d",
+        Unit::Hertz => "hz",
+        Unit::Ohm => "ohm",
+        Unit::Degree => "deg",
+        Unit::Volt => "v",
+        Unit::Millivolt => "mv",
+        Unit::Ampere => "a",
+        Unit::Milliampere => "ma",
+        Unit::Microampere => "ua",
+        Unit::Unknown | Unit::Other(_) => return stem.into(),
+    };
+    format!("{stem}_{suffix}")
 }

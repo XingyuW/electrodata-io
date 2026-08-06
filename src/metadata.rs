@@ -1,6 +1,7 @@
 //! Typed, raw, and provenance metadata.
 
 use crate::source::ContainerFormat;
+use crate::{ColumnRole, FormatId, ReadOptions, Unit};
 use chrono::NaiveDateTime;
 
 #[cfg(feature = "serde")]
@@ -71,6 +72,43 @@ pub struct RawMetadataRow {
 /// Physical origin and selected container member.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum TextEncoding {
+    Utf8,
+    Utf8Lossy,
+}
+
+/// Exact source-position schema retained in provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct SourceColumnProvenance {
+    pub position: usize,
+    pub source_name: String,
+    pub canonical_name: String,
+    pub role: ColumnRole,
+    pub unit: Unit,
+}
+
+/// Cached workbook formula result classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum FormulaCacheStatus {
+    UsableNumeric,
+    Unusable,
+}
+
+/// Formula identity and cache status at an exact worksheet cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct FormulaProvenance {
+    pub row: usize,
+    pub column: usize,
+    pub formula: String,
+    pub cache_status: FormulaCacheStatus,
+}
+
+/// Physical origin and selected container member.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Provenance {
     /// Caller-provided path.
     pub path: String,
@@ -80,6 +118,24 @@ pub struct Provenance {
     pub container: ContainerFormat,
     /// Selected workbook sheet.
     pub worksheet: Option<String>,
+    /// Detected delimiter for text sources.
+    pub delimiter: Option<char>,
+    /// Detected text encoding; workbook containers use `None`.
+    pub encoding: Option<TextEncoding>,
+    /// Selected scientific format.
+    pub detected_format: FormatId,
+    /// Confidence of the selected format candidate.
+    pub detection_confidence: f32,
+    /// Evidence used to select the format.
+    pub detection_evidence: Vec<String>,
+    /// Exact active read and recovery policies.
+    pub read_options: ReadOptions,
+    /// Exact source-position column identities.
+    pub source_columns: Vec<SourceColumnProvenance>,
+    /// Workbook formulas and their cached-result usability.
+    pub formulas: Vec<FormulaProvenance>,
+    /// Lowercase SHA-256 digest of the physical source bytes.
+    pub source_sha256: String,
 }
 
 /// Metadata retained in typed and raw forms.

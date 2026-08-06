@@ -1,131 +1,460 @@
-//! Error types.
+//! Structured error types and stable classification.
 
-use crate::DetectionResult;
 use crate::formats::FormatId;
-use std::path::PathBuf;
+use crate::{DatasetKind, DetectionResult, Diagnostic};
+use std::path::{Path, PathBuf};
 
-/// Crate result type.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Stable high-level category for programmatic error handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ErrorCategory {
+    Io,
+    UnsupportedContainer,
+    UnsupportedBinary,
+    Encoding,
+    Detection,
+    Worksheet,
+    Schema,
+    MalformedNumeric,
+    RaggedRow,
+    MissingValue,
+    CoordinateOrder,
+    Unit,
+    Formula,
+    Metadata,
+    Backend,
+    Accessor,
+}
+
+/// Uniform structured context available for every [`Error`].
+#[derive(Debug, Clone, Copy)]
+pub struct ErrorContext<'a> {
+    pub path: Option<&'a Path>,
+    pub worksheet: Option<&'a str>,
+    pub format_candidate: Option<&'a FormatId>,
+    pub row: Option<usize>,
+    pub column: Option<usize>,
+    pub category: ErrorCategory,
+    pub diagnostics: &'a [Diagnostic],
+}
 
 /// Structured read failure.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
-    /// Filesystem I/O failed.
+    #[error("{source}")]
+    ReadContext {
+        path: PathBuf,
+        worksheet: Option<String>,
+        format_candidate: Option<FormatId>,
+        diagnostics: Vec<Diagnostic>,
+        #[source]
+        source: Box<Error>,
+    },
     #[error("I/O failure for {path}: {source}")]
     Io {
-        /// Path whose operation failed.
         path: PathBuf,
-        /// Underlying I/O failure.
         #[source]
         source: std::io::Error,
     },
-    /// The storage container is unsupported or its feature is disabled.
-    #[error("unsupported container format: {0}")]
-    UnsupportedContainer(String),
-    /// A workbook could not be opened.
-    #[error("workbook opening failure for {path}: {message}")]
-    WorkbookOpening {
-        /// Workbook path.
+    #[error("unsupported container format for {path}: {container}")]
+    UnsupportedContainer { path: PathBuf, container: String },
+    #[error("unsupported binary input {path} (magic {magic})")]
+    UnsupportedBinary {
         path: PathBuf,
-        /// Reader-provided failure detail.
-        message: String,
+        magic: String,
+        format_candidate: Option<FormatId>,
+        diagnostics: Vec<Diagnostic>,
     },
-    /// The requested worksheet does not exist.
-    #[error("missing worksheet: {0}")]
-    MissingWorksheet(String),
-    /// No scientific handler confidently recognized the input.
+    #[error("workbook opening failure for {path}: {source}")]
+    WorkbookOpening {
+        path: PathBuf,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[error("missing worksheet {worksheet:?} in {path}")]
+    MissingWorksheet { path: PathBuf, worksheet: String },
     #[error(
-        "unknown scientific format (best confidence {best_confidence:.3}, threshold {threshold:.3})"
+        "unknown scientific format for {path} (best confidence {best_confidence:.3}, threshold {threshold:.3})"
     )]
     UnknownFormat {
-        /// Strongest confidence returned by any registered handler.
+        path: PathBuf,
         best_confidence: f32,
-        /// Configured minimum confidence.
         threshold: f32,
     },
-    /// No built-in format had adequate evidence for a bounded source preview.
     #[error("unknown scientific format for {path}: {evidence:?}")]
     UnknownFormatDetailed {
-        /// Source path.
         path: PathBuf,
-        /// Evidence collected while probing the source.
         evidence: Vec<String>,
     },
-    /// Scientific handlers or worksheets were too close to choose safely.
-    #[error("ambiguous scientific format: {candidates:?}")]
+    #[error("ambiguous scientific format for {path}: {candidates:?}")]
     AmbiguousFormat {
-        /// Leading candidates and their confidence values.
+        path: PathBuf,
         candidates: Vec<(FormatId, f32)>,
     },
-    /// Multiple built-in formats had similarly strong content evidence.
-    #[error("ambiguous scientific format detection: {candidates:?}")]
+    #[error("ambiguous scientific format detection for {path}: {candidates:?}")]
     AmbiguousDetection {
-        /// Leading scientific-format candidates and their evidence.
+        path: PathBuf,
         candidates: Vec<DetectionResult>,
     },
-    /// A required table header was not found.
     #[error("header not found")]
     HeaderNotFound,
-    /// Header roles do not form a valid signature.
+    #[error("ambiguous headerless schema for {path}")]
+    AmbiguousHeaderlessSchema {
+        path: PathBuf,
+        format_candidate: Option<FormatId>,
+        diagnostics: Vec<Diagnostic>,
+    },
     #[error("invalid column signature: {0}")]
     InvalidColumnSignature(String),
-    /// A row has an unexpected number of columns.
     #[error("invalid column count at row {row}: expected {expected}, found {actual}")]
     InvalidColumnCount {
-        /// One-based source row.
         row: usize,
-        /// Required width.
         expected: usize,
-        /// Observed width.
         actual: usize,
     },
-    /// A numeric cell could not be parsed.
     #[error("malformed numeric value at row {row}, column {column}: {value:?}")]
     MalformedNumeric {
-        /// One-based source row.
+        path: PathBuf,
+        format_candidate: Option<FormatId>,
         row: usize,
-        /// One-based source column.
         column: usize,
-        /// Original cell text.
         value: String,
+        diagnostics: Vec<Diagnostic>,
+        #[source]
+        source: Option<std::num::ParseFloatError>,
     },
-    /// A row is ragged.
     #[error("ragged row {row}: expected {expected} cells, found {actual}")]
     RaggedRow {
-        /// One-based source row.
+        path: PathBuf,
+        format_candidate: Option<FormatId>,
         row: usize,
-        /// Required width.
         expected: usize,
-        /// Observed width.
         actual: usize,
+        diagnostics: Vec<Diagnostic>,
     },
-    /// The detected data section has no rows.
+    #[error("missing required coordinate at row {row}, column {column}")]
+    MissingCoordinate {
+        path: PathBuf,
+        format_candidate: Option<FormatId>,
+        row: usize,
+        column: usize,
+        diagnostics: Vec<Diagnostic>,
+    },
+    #[error("missing required role {role:?} for {format_candidate} in {path}")]
+    MissingRequiredRole {
+        path: PathBuf,
+        format_candidate: FormatId,
+        role: crate::ColumnRole,
+        diagnostics: Vec<Diagnostic>,
+    },
+    #[error("duplicate {role:?} coordinate at source row {row}")]
+    DuplicateCoordinate {
+        path: PathBuf,
+        format_candidate: Option<FormatId>,
+        role: crate::ColumnRole,
+        row: usize,
+        column: usize,
+        diagnostics: Vec<Diagnostic>,
+    },
+    #[error("nonmonotonic {role:?} coordinate at source row {row}")]
+    NonMonotonicCoordinate {
+        path: PathBuf,
+        format_candidate: Option<FormatId>,
+        role: crate::ColumnRole,
+        row: usize,
+        column: usize,
+        diagnostics: Vec<Diagnostic>,
+    },
+    #[error("unusable formula cache at row {row}, column {column} in worksheet {worksheet:?}")]
+    UnusableFormula {
+        path: PathBuf,
+        worksheet: Option<Box<str>>,
+        format_candidate: Option<Box<FormatId>>,
+        row: usize,
+        column: usize,
+        formula: Box<str>,
+        diagnostics: Box<[Diagnostic]>,
+    },
     #[error("empty data section")]
     EmptyData,
-    /// Polars failed while constructing or reading a frame.
     #[error("Polars failure: {0}")]
     Polars(#[from] polars::error::PolarsError),
-    /// Calamine failed while reading a workbook.
-    #[error("Calamine failure: {0}")]
-    Calamine(String),
-    /// Required metadata could not be parsed.
-    #[error("metadata parsing failure at row {row}: {message}")]
-    Metadata {
-        /// One-based source row, or zero when unavailable.
+    #[error("Calamine failure for {path}: {source}")]
+    Calamine {
+        path: PathBuf,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[error("delimited-text decoding failure for {path} at row {row}: {source}")]
+    DelimitedText {
+        path: PathBuf,
         row: usize,
-        /// Parser-provided detail.
-        message: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
-    /// Strict UTF-8 decoding failed.
-    #[error("invalid UTF-8 at byte {valid_up_to}")]
+    #[error("metadata parsing failure at row {row}: {message}")]
+    Metadata { row: usize, message: String },
+    #[error("invalid UTF-8 in {path} at byte {valid_up_to}")]
     InvalidUtf8 {
-        /// Byte offset up to which decoding was valid.
+        path: PathBuf,
         valid_up_to: usize,
+        #[source]
+        source: std::str::Utf8Error,
     },
-    /// A forced handler is not registered.
     #[error("format handler is not registered: {0}")]
     UnregisteredFormat(FormatId),
-    /// An accessor could not find the requested role.
     #[error("column role not found: {0:?}")]
-    ColumnRoleNotFound(crate::schema::ColumnRole),
+    ColumnRoleNotFound(crate::ColumnRole),
+    #[error("column role is ambiguous: {role:?} ({matches} matches)")]
+    ColumnRoleAmbiguous {
+        role: crate::ColumnRole,
+        matches: usize,
+    },
+    #[error("dataset kind {actual:?} cannot be viewed as {expected:?}")]
+    WrongDatasetKind {
+        expected: DatasetKind,
+        actual: DatasetKind,
+    },
+    #[error("missing value for {role:?} at dataset row {row}")]
+    MissingValue {
+        path: PathBuf,
+        role: crate::ColumnRole,
+        row: usize,
+        source_row: Option<usize>,
+        column: Option<usize>,
+    },
+    #[error("unknown source unit for required role {role:?} in {path}")]
+    UnknownUnit {
+        path: PathBuf,
+        role: crate::ColumnRole,
+        column: Option<usize>,
+    },
+    #[error("cannot convert {role:?} from {source_unit:?} to {target_unit:?} in {path}")]
+    IncompatibleUnit {
+        path: PathBuf,
+        role: crate::ColumnRole,
+        source_unit: crate::Unit,
+        target_unit: crate::Unit,
+        column: Option<usize>,
+    },
+}
+
+impl Error {
+    /// Returns all common context without matching individual error variants.
+    pub fn context(&self) -> ErrorContext<'_> {
+        ErrorContext {
+            path: self.path(),
+            worksheet: self.worksheet(),
+            format_candidate: self.format_candidate(),
+            row: self.row(),
+            column: self.column(),
+            category: self.category(),
+            diagnostics: self.diagnostics(),
+        }
+    }
+
+    /// Retained underlying parser/backend error, when one exists.
+    pub fn source_error(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(self)
+    }
+
+    /// Stable error category, independent of display wording.
+    pub fn category(&self) -> ErrorCategory {
+        match self {
+            Self::ReadContext { source, .. } => source.category(),
+            Self::Io { .. } => ErrorCategory::Io,
+            Self::UnsupportedContainer { .. } => ErrorCategory::UnsupportedContainer,
+            Self::UnsupportedBinary { .. } => ErrorCategory::UnsupportedBinary,
+            Self::InvalidUtf8 { .. } => ErrorCategory::Encoding,
+            Self::UnknownFormat { .. }
+            | Self::UnknownFormatDetailed { .. }
+            | Self::AmbiguousFormat { .. }
+            | Self::AmbiguousDetection { .. }
+            | Self::UnregisteredFormat(_) => ErrorCategory::Detection,
+            Self::WorkbookOpening { .. }
+            | Self::MissingWorksheet { .. }
+            | Self::Calamine { .. } => ErrorCategory::Worksheet,
+            Self::HeaderNotFound
+            | Self::AmbiguousHeaderlessSchema { .. }
+            | Self::InvalidColumnSignature(_)
+            | Self::InvalidColumnCount { .. }
+            | Self::MissingRequiredRole { .. }
+            | Self::EmptyData => ErrorCategory::Schema,
+            Self::MalformedNumeric { .. } => ErrorCategory::MalformedNumeric,
+            Self::RaggedRow { .. } => ErrorCategory::RaggedRow,
+            Self::MissingCoordinate { .. } | Self::MissingValue { .. } => {
+                ErrorCategory::MissingValue
+            }
+            Self::DuplicateCoordinate { .. } | Self::NonMonotonicCoordinate { .. } => {
+                ErrorCategory::CoordinateOrder
+            }
+            Self::UnknownUnit { .. } | Self::IncompatibleUnit { .. } => ErrorCategory::Unit,
+            Self::UnusableFormula { .. } => ErrorCategory::Formula,
+            Self::Metadata { .. } => ErrorCategory::Metadata,
+            Self::Polars(_) | Self::DelimitedText { .. } => ErrorCategory::Backend,
+            Self::ColumnRoleNotFound(_)
+            | Self::ColumnRoleAmbiguous { .. }
+            | Self::WrongDatasetKind { .. } => ErrorCategory::Accessor,
+        }
+    }
+
+    /// Physical path retained by this error, when applicable.
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::ReadContext { path, .. }
+            | Self::Io { path, .. }
+            | Self::UnsupportedBinary { path, .. }
+            | Self::UnsupportedContainer { path, .. }
+            | Self::WorkbookOpening { path, .. }
+            | Self::MissingWorksheet { path, .. }
+            | Self::Calamine { path, .. }
+            | Self::DelimitedText { path, .. }
+            | Self::UnknownFormatDetailed { path, .. }
+            | Self::UnknownFormat { path, .. }
+            | Self::AmbiguousFormat { path, .. }
+            | Self::AmbiguousDetection { path, .. }
+            | Self::AmbiguousHeaderlessSchema { path, .. }
+            | Self::MalformedNumeric { path, .. }
+            | Self::RaggedRow { path, .. }
+            | Self::MissingCoordinate { path, .. }
+            | Self::MissingRequiredRole { path, .. }
+            | Self::DuplicateCoordinate { path, .. }
+            | Self::NonMonotonicCoordinate { path, .. }
+            | Self::UnusableFormula { path, .. }
+            | Self::MissingValue { path, .. }
+            | Self::UnknownUnit { path, .. }
+            | Self::IncompatibleUnit { path, .. }
+            | Self::InvalidUtf8 { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    /// Selected format candidate retained by this error, when known.
+    pub fn format_candidate(&self) -> Option<&FormatId> {
+        match self {
+            Self::ReadContext {
+                format_candidate, ..
+            }
+            | Self::UnsupportedBinary {
+                format_candidate, ..
+            }
+            | Self::AmbiguousHeaderlessSchema {
+                format_candidate, ..
+            }
+            | Self::MalformedNumeric {
+                format_candidate, ..
+            }
+            | Self::RaggedRow {
+                format_candidate, ..
+            }
+            | Self::MissingCoordinate {
+                format_candidate, ..
+            }
+            | Self::DuplicateCoordinate {
+                format_candidate, ..
+            }
+            | Self::NonMonotonicCoordinate {
+                format_candidate, ..
+            } => format_candidate.as_ref(),
+            Self::UnusableFormula {
+                format_candidate, ..
+            } => format_candidate.as_deref(),
+            Self::MissingRequiredRole {
+                format_candidate, ..
+            } => Some(format_candidate),
+            _ => None,
+        }
+    }
+
+    /// Selected or requested worksheet retained by this error, when singular.
+    pub fn worksheet(&self) -> Option<&str> {
+        match self {
+            Self::ReadContext { worksheet, .. } => worksheet.as_deref(),
+            Self::MissingWorksheet { worksheet, .. } => Some(worksheet),
+            Self::UnusableFormula { worksheet, .. } => worksheet.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// One-based source row retained by this error, when known.
+    pub fn row(&self) -> Option<usize> {
+        match self {
+            Self::ReadContext { source, .. } => source.row(),
+            Self::InvalidColumnCount { row, .. }
+            | Self::MalformedNumeric { row, .. }
+            | Self::RaggedRow { row, .. }
+            | Self::MissingCoordinate { row, .. }
+            | Self::DuplicateCoordinate { row, .. }
+            | Self::NonMonotonicCoordinate { row, .. }
+            | Self::UnusableFormula { row, .. }
+            | Self::Metadata { row, .. }
+            | Self::DelimitedText { row, .. } => Some(*row),
+            Self::MissingValue { source_row, .. } => *source_row,
+            _ => None,
+        }
+    }
+
+    /// One-based source column retained by this error, when known.
+    pub fn column(&self) -> Option<usize> {
+        match self {
+            Self::ReadContext { source, .. } => source.column(),
+            Self::MalformedNumeric { column, .. }
+            | Self::MissingCoordinate { column, .. }
+            | Self::DuplicateCoordinate { column, .. }
+            | Self::NonMonotonicCoordinate { column, .. } => Some(*column),
+            Self::UnusableFormula { column, .. } => Some(*column),
+            Self::MissingValue { column, .. }
+            | Self::UnknownUnit { column, .. }
+            | Self::IncompatibleUnit { column, .. } => *column,
+            _ => None,
+        }
+    }
+
+    /// Diagnostics accumulated before failure.
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        match self {
+            Self::ReadContext {
+                diagnostics,
+                source,
+                ..
+            } => {
+                if diagnostics.is_empty() {
+                    source.diagnostics()
+                } else {
+                    diagnostics
+                }
+            }
+            Self::UnsupportedBinary { diagnostics, .. }
+            | Self::AmbiguousHeaderlessSchema { diagnostics, .. }
+            | Self::MalformedNumeric { diagnostics, .. }
+            | Self::RaggedRow { diagnostics, .. }
+            | Self::MissingCoordinate { diagnostics, .. }
+            | Self::MissingRequiredRole { diagnostics, .. }
+            | Self::DuplicateCoordinate { diagnostics, .. }
+            | Self::NonMonotonicCoordinate { diagnostics, .. } => diagnostics,
+            Self::UnusableFormula { diagnostics, .. } => diagnostics,
+            _ => &[],
+        }
+    }
+
+    pub(crate) fn with_read_context(
+        self,
+        path: &Path,
+        worksheet: Option<&str>,
+        format_candidate: Option<FormatId>,
+    ) -> Self {
+        if self.path().is_some() {
+            self
+        } else {
+            Self::ReadContext {
+                path: path.to_path_buf(),
+                worksheet: worksheet.map(str::to_owned),
+                format_candidate,
+                diagnostics: Vec::new(),
+                source: Box::new(self),
+            }
+        }
+    }
 }

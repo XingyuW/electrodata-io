@@ -5,15 +5,21 @@ use crate::formats::{
     RegularXyHandler,
 };
 use crate::metadata::{
-    AcquisitionMetadata, Metadata, MetadataValue, Parameter, Provenance, RawMetadataRow,
+    AcquisitionMetadata, FormulaCacheStatus, FormulaProvenance, Metadata, MetadataValue, Parameter,
+    Provenance, RawMetadataRow, SourceColumnProvenance,
 };
 #[cfg(feature = "csv")]
 use crate::source::csv_source;
 use crate::source::{ContainerFormat, Probe};
 use crate::validation;
-use crate::{ColumnNamePolicy, Dataset, DetectionResult, Error, ReadOptions, Result};
+use crate::{
+    ColumnNamePolicy, ColumnRole, CoordinateOrderPolicy, Dataset, DetectionResult, Diagnostic,
+    DiagnosticCode, Error, InvalidCellPolicy, InvalidTimePolicy, RaggedRowPolicy, ReadOptions,
+    RecoveryAction, Result, Severity, TextEncoding, Unit,
+};
 use chrono::NaiveDateTime;
 use polars::prelude::{Column, DataFrame};
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -34,6 +40,17 @@ pub(crate) struct SourceData {
     pub rows: Vec<Vec<String>>,
     pub raw_rows: Vec<String>,
     pub diagnostics: Vec<crate::Diagnostic>,
+    pub encoding: Option<TextEncoding>,
+    pub source_sha256: String,
+    pub formula_cells: Vec<FormulaCell>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FormulaCell {
+    pub row: usize,
+    pub column: usize,
+    pub formula: String,
+    pub usable_numeric_cache: bool,
 }
 
 impl DataReader {
@@ -59,9 +76,10 @@ impl DataReader {
             #[cfg(feature = "excel")]
             container => crate::source::excel::read(self, path, container, options),
             #[cfg(not(feature = "excel"))]
-            container => Err(Error::UnsupportedContainer(format!(
-                "{container:?}; enable the excel feature"
-            ))),
+            container => Err(Error::UnsupportedContainer {
+                path: path.to_path_buf(),
+                container: format!("{container:?}; enable the excel feature"),
+            }),
         }
     }
 
@@ -82,17 +100,19 @@ impl DataReader {
                 #[cfg(not(feature = "csv"))]
                 {
                     let _ = options;
-                    Err(Error::UnsupportedContainer(
-                        "CSV; enable the csv feature".into(),
-                    ))
+                    Err(Error::UnsupportedContainer {
+                        path: path.to_path_buf(),
+                        container: "CSV; enable the csv feature".into(),
+                    })
                 }
             }
             #[cfg(feature = "excel")]
             container => crate::source::excel::detect(self, path, container, &options),
             #[cfg(not(feature = "excel"))]
-            container => Err(Error::UnsupportedContainer(format!(
-                "{container:?}; enable the excel feature"
-            ))),
+            container => Err(Error::UnsupportedContainer {
+                path: path.to_path_buf(),
+                container: format!("{container:?}; enable the excel feature"),
+            }),
         }
     }
 
@@ -114,6 +134,7 @@ impl DataReader {
 
     pub(crate) fn choose<'a>(
         &'a self,
+        path: &Path,
         probe: &Probe,
         options: &ReadOptions,
     ) -> Result<(&'a dyn FormatHandler, Detection)> {
@@ -140,8 +161,17 @@ impl DataReader {
                         Error::InvalidColumnSignature(format!(
                             "input is incompatible with forced format {forced}"
                         ))
+                        .with_read_context(
+                            path,
+                            probe.worksheet_name.as_deref(),
+                            Some(forced.clone()),
+                        )
                     } else {
-                        Error::UnregisteredFormat(forced.clone())
+                        Error::UnregisteredFormat(forced.clone()).with_read_context(
+                            path,
+                            probe.worksheet_name.as_deref(),
+                            Some(forced.clone()),
+                        )
                     }
                 });
         }
@@ -151,6 +181,7 @@ impl DataReader {
             .unwrap_or(0.0);
         if best_confidence < options.detection_threshold {
             return Err(Error::UnknownFormat {
+                path: path.to_path_buf(),
                 best_confidence,
                 threshold: options.detection_threshold,
             });
@@ -160,6 +191,7 @@ impl DataReader {
             .is_some_and(|second| best_confidence - second.1.confidence < options.detection_margin)
         {
             return Err(Error::AmbiguousFormat {
+                path: path.to_path_buf(),
                 candidates: candidates
                     .iter()
                     .take(3)
@@ -168,6 +200,7 @@ impl DataReader {
             });
         }
         candidates.into_iter().next().ok_or(Error::UnknownFormat {
+            path: path.to_path_buf(),
             best_confidence: 0.0,
             threshold: options.detection_threshold,
         })
@@ -177,14 +210,15 @@ impl DataReader {
         #[cfg(not(feature = "csv"))]
         {
             let _ = (path, options);
-            Err(Error::UnsupportedContainer(
-                "CSV; enable the csv feature".into(),
-            ))
+            Err(Error::UnsupportedContainer {
+                path: path.to_path_buf(),
+                container: "CSV; enable the csv feature".into(),
+            })
         }
         #[cfg(feature = "csv")]
         {
             let input = csv_source::open(path, options.probe_rows, options.allow_lossy_utf8)?;
-            let (handler, detection) = self.choose(&input.probe, options)?;
+            let (handler, detection) = self.choose(path, &input.probe, options)?;
             self.assemble(
                 path,
                 SourceData {
@@ -192,6 +226,9 @@ impl DataReader {
                     rows: input.rows,
                     raw_rows: input.raw_rows,
                     diagnostics: input.diagnostics,
+                    encoding: Some(input.encoding),
+                    source_sha256: input.source_sha256,
+                    formula_cells: Vec::new(),
                 },
                 handler,
                 detection,
@@ -208,29 +245,135 @@ impl DataReader {
         detection: Detection,
         options: &ReadOptions,
     ) -> Result<Dataset> {
-        let descriptors = handler.columns(&source.probe, &detection)?;
-        let data = numeric_frame(
-            &source.rows,
-            &descriptors,
-            &detection,
-            options.column_name_policy,
-        )?;
+        let SourceData {
+            probe,
+            rows,
+            raw_rows,
+            diagnostics: source_diagnostics,
+            encoding,
+            source_sha256,
+            formula_cells,
+        } = source;
+        let descriptors = handler.columns(&probe, &detection).map_err(|error| {
+            error.with_read_context(
+                path,
+                probe.worksheet_name.as_deref(),
+                Some(detection.format.clone()),
+            )
+        })?;
+        if detection.format == crate::FormatId::ChiEis {
+            for role in [
+                ColumnRole::Frequency,
+                ColumnRole::ImpedanceReal,
+                ColumnRole::ImpedanceImaginary,
+            ] {
+                if !descriptors.iter().any(|descriptor| descriptor.role == role) {
+                    return Err(Error::MissingRequiredRole {
+                        path: path.to_path_buf(),
+                        format_candidate: detection.format.clone(),
+                        role,
+                        diagnostics: Vec::new(),
+                    });
+                }
+            }
+        }
+        if !detection.layout.has_header && !options.permits_headerless_inference() {
+            return Err(Error::AmbiguousHeaderlessSchema {
+                path: path.to_path_buf(),
+                format_candidate: Some(detection.format.clone()),
+                diagnostics: Vec::new(),
+            });
+        }
+        let mut decoded = numeric_frame(
+            &rows,
+            DecodeContext {
+                path,
+                columns: &descriptors,
+                detection: &detection,
+                naming: options.column_name_policy,
+                options,
+                worksheet: probe.worksheet_name.as_deref(),
+                formula_cells: &formula_cells,
+            },
+        )
+        .map_err(|error| {
+            error.with_read_context(
+                path,
+                probe.worksheet_name.as_deref(),
+                Some(detection.format.clone()),
+            )
+        })?;
         let metadata = parse_metadata(
-            path,
-            &source.probe,
-            &source.rows,
-            &source.raw_rows,
-            &detection,
+            &rows,
+            &raw_rows,
+            MetadataContext {
+                path,
+                probe: &probe,
+                detection: &detection,
+                options,
+                descriptors: &descriptors,
+                formula_cells: &formula_cells,
+                encoding,
+                source_sha256,
+            },
         );
-        let mut diagnostics = source.diagnostics;
-        let mut dataset = Dataset {
-            data,
+        let mut diagnostics: Vec<Diagnostic> = source_diagnostics
+            .into_iter()
+            .map(|diagnostic| {
+                diagnostic.with_context(
+                    path,
+                    probe.worksheet_name.as_deref(),
+                    &detection.format,
+                    options.effective_profile(),
+                )
+            })
+            .collect();
+        diagnostics.append(&mut decoded.diagnostics);
+        if !detection.layout.has_header {
+            diagnostics.push(
+                diagnostic(
+                    path,
+                    probe.worksheet_name.as_deref(),
+                    &detection.format,
+                    options,
+                    Severity::Warning,
+                    DiagnosticCode::HeaderlessRoleInference,
+                    "headerless schema inferred: first column is Time and remaining columns are Unknown",
+                )
+                .at(detection.layout.data_start_row + 1, None)
+                .recovered(RecoveryAction::RolesInferred),
+            );
+            diagnostics.push(
+                diagnostic(
+                    path,
+                    probe.worksheet_name.as_deref(),
+                    &detection.format,
+                    options,
+                    Severity::Warning,
+                    DiagnosticCode::UnknownUnit,
+                    "headerless columns have unknown source units",
+                )
+                .at(detection.layout.data_start_row + 1, None)
+                .recovered(RecoveryAction::Preserved),
+            );
+        }
+        let mut dataset = Dataset::from_parts(
+            decoded.data,
             metadata,
-            format: detection.format,
-            columns: descriptors,
-            diagnostics: Vec::new(),
-        };
-        validation::validate(&dataset, options, &mut diagnostics)?;
+            detection.format.clone(),
+            descriptors,
+            decoded.values,
+            decoded.source_rows,
+            decoded.source_data_row_count,
+        );
+        validate_coordinate_order(path, &dataset, options, &mut diagnostics)?;
+        validation::validate(&dataset, options, &mut diagnostics).map_err(|error| {
+            error.with_read_context(
+                path,
+                probe.worksheet_name.as_deref(),
+                Some(detection.format.clone()),
+            )
+        })?;
         dataset.diagnostics = diagnostics;
         Ok(dataset)
     }
@@ -265,30 +408,97 @@ impl DataReaderBuilder {
 }
 
 fn container_for(path: &Path) -> Result<ContainerFormat> {
-    match path
+    let mut file = std::fs::File::open(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut prefix = [0_u8; 8192];
+    let length = file.read(&mut prefix).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let bytes = &prefix[..length];
+    let extension = path
         .extension()
         .and_then(|value| value.to_str())
         .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("csv" | "txt" | "tsv") => Ok(ContainerFormat::Csv),
-        Some("xlsx") => Ok(ContainerFormat::Xlsx),
-        Some("xls") => Ok(ContainerFormat::Xls),
-        Some("xlsb") => Ok(ContainerFormat::Xlsb),
-        Some("ods") => Ok(ContainerFormat::Ods),
-        Some(value) => Err(Error::UnsupportedContainer(value.into())),
-        None => Err(Error::UnsupportedContainer("missing extension".into())),
+        .unwrap_or_default();
+    if bytes.starts_with(b"PK\x03\x04") {
+        return Ok(match extension.as_str() {
+            "ods" => ContainerFormat::Ods,
+            "xlsb" => ContainerFormat::Xlsb,
+            _ => ContainerFormat::Xlsx,
+        });
     }
+    if bytes.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) {
+        return Err(Error::UnsupportedContainer {
+            path: path.to_path_buf(),
+            container: "legacy XLS/OLE workbooks are intentionally unsupported".into(),
+        });
+    }
+    if looks_binary(bytes) {
+        let magic = bytes
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join("");
+        return Err(Error::UnsupportedBinary {
+            path: path.to_path_buf(),
+            magic,
+            format_candidate: None,
+            diagnostics: Vec::new(),
+        });
+    }
+    // Text content wins over the extension. This intentionally includes .dat
+    // and permits controlled extensionless/custom-extension imports.
+    Ok(ContainerFormat::Csv)
 }
 
-fn numeric_frame(
-    rows: &[Vec<String>],
-    columns: &[crate::ColumnDescriptor],
-    detection: &Detection,
+fn looks_binary(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    let suspicious = bytes
+        .iter()
+        .filter(|byte| **byte == 0 || (**byte < 0x09) || (0x0E..0x20).contains(*byte))
+        .count();
+    bytes.contains(&0) || suspicious * 20 > bytes.len()
+}
+
+struct DecodedTable {
+    data: DataFrame,
+    values: Vec<Vec<Option<f64>>>,
+    source_rows: Vec<usize>,
+    source_data_row_count: usize,
+    diagnostics: Vec<Diagnostic>,
+}
+
+struct DecodeContext<'a> {
+    path: &'a Path,
+    columns: &'a [crate::ColumnDescriptor],
+    detection: &'a Detection,
     naming: ColumnNamePolicy,
-) -> Result<DataFrame> {
+    options: &'a ReadOptions,
+    worksheet: Option<&'a str>,
+    formula_cells: &'a [FormulaCell],
+}
+
+fn numeric_frame(rows: &[Vec<String>], context: DecodeContext<'_>) -> Result<DecodedTable> {
+    let DecodeContext {
+        path,
+        columns,
+        detection,
+        naming,
+        options,
+        worksheet,
+        formula_cells,
+    } = context;
     let expected = detection.layout.expected_column_count;
     let mut values: Vec<Vec<Option<f64>>> = (0..expected).map(|_| Vec::new()).collect();
+    let mut source_rows = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut source_data_row_count = 0;
     for (index, row) in rows
         .iter()
         .enumerate()
@@ -301,61 +511,571 @@ fn numeric_frame(
             {
                 break;
             }
-            return Err(Error::RaggedRow {
-                row: index + 1,
-                expected,
-                actual: 0,
-            });
+            continue;
         }
-        if row.len() != expected {
-            return Err(Error::RaggedRow {
-                row: index + 1,
-                expected,
-                actual: row.len(),
-            });
-        }
-        for (column, cell) in row.iter().enumerate() {
-            let value = cell.trim();
-            if value.is_empty() {
-                values[column].push(None);
+        source_data_row_count += 1;
+        let source_row = index + 1;
+        let mut cells = row.clone();
+        let source_cell_count = cells.len();
+        if cells.len() != expected {
+            if options.ragged_row_policy == RaggedRowPolicy::Error {
+                return Err(Error::RaggedRow {
+                    path: path.to_path_buf(),
+                    format_candidate: Some(detection.format.clone()),
+                    row: source_row,
+                    expected,
+                    actual: cells.len(),
+                    diagnostics,
+                });
+            }
+            diagnostics.push(
+                diagnostic(
+                    path,
+                    worksheet,
+                    &detection.format,
+                    options,
+                    Severity::Warning,
+                    DiagnosticCode::RaggedRow,
+                    format!("source row has {} cells; expected {expected}", cells.len()),
+                )
+                .at(source_row, None),
+            );
+            if cells.len() < expected {
+                let first_missing = cells.len();
+                cells.resize(expected, String::new());
+                diagnostics.push(
+                    diagnostic(
+                        path,
+                        worksheet,
+                        &detection.format,
+                        options,
+                        Severity::Warning,
+                        DiagnosticCode::RowPadded,
+                        format!(
+                            "short row padded with {} null cell(s)",
+                            expected - first_missing
+                        ),
+                    )
+                    .at(source_row, Some(first_missing + 1))
+                    .for_column(column_label(columns, first_missing))
+                    .recovered(RecoveryAction::RowPadded),
+                );
             } else {
-                values[column].push(Some(value.parse::<f64>().map_err(|_| {
-                    Error::MalformedNumeric {
-                        row: index + 1,
-                        column: column + 1,
-                        value: value.into(),
-                    }
-                })?));
+                let extra = cells.len() - expected;
+                cells.truncate(expected);
+                diagnostics.push(
+                    diagnostic(
+                        path,
+                        worksheet,
+                        &detection.format,
+                        options,
+                        Severity::Warning,
+                        DiagnosticCode::ExtraCellsIgnored,
+                        format!("ignored {extra} trailing cell(s)"),
+                    )
+                    .at(source_row, Some(expected + 1))
+                    .for_column(format!("column_{}", expected + 1))
+                    .recovered(RecoveryAction::ExtraCellsIgnored),
+                );
             }
         }
+        let mut decoded_row = Vec::with_capacity(expected);
+        let mut skip_row = false;
+        for (column, cell) in cells.iter().enumerate() {
+            let value = cell.trim();
+            let coordinate = columns
+                .get(column)
+                .is_some_and(|descriptor| is_coordinate(&descriptor.role));
+            if let Some(formula) = formula_cells.iter().find(|formula| {
+                formula.row == source_row
+                    && formula.column == column + 1
+                    && !formula.usable_numeric_cache
+            }) {
+                if coordinate && options.invalid_time_policy == InvalidTimePolicy::SkipRow {
+                    diagnostics.push(
+                        diagnostic(
+                            path,
+                            worksheet,
+                            &detection.format,
+                            options,
+                            Severity::Warning,
+                            DiagnosticCode::UnusableFormula,
+                            "formula has no usable cached numeric coordinate; source row skipped",
+                        )
+                        .at(source_row, Some(column + 1))
+                        .for_column(column_label(columns, column))
+                        .with_token(&formula.formula)
+                        .recovered(RecoveryAction::RowSkipped),
+                    );
+                    decoded_row.push(None);
+                    skip_row = true;
+                    continue;
+                }
+                if !coordinate && options.invalid_cell_policy == InvalidCellPolicy::Null {
+                    diagnostics.push(
+                        diagnostic(
+                            path,
+                            worksheet,
+                            &detection.format,
+                            options,
+                            Severity::Warning,
+                            DiagnosticCode::UnusableFormula,
+                            "formula has no usable cached numeric result; value replaced with null",
+                        )
+                        .at(source_row, Some(column + 1))
+                        .for_column(column_label(columns, column))
+                        .with_token(&formula.formula)
+                        .recovered(RecoveryAction::ValueReplacedWithMissing),
+                    );
+                    decoded_row.push(None);
+                    continue;
+                }
+                return Err(Error::UnusableFormula {
+                    path: path.to_path_buf(),
+                    worksheet: worksheet.map(Into::into),
+                    format_candidate: Some(Box::new(detection.format.clone())),
+                    row: source_row,
+                    column: column + 1,
+                    formula: formula.formula.clone().into_boxed_str(),
+                    diagnostics: diagnostics.into_boxed_slice(),
+                });
+            }
+            if value.is_empty() || is_missing_token(value) {
+                if coordinate {
+                    if options.invalid_time_policy == InvalidTimePolicy::Error {
+                        return Err(Error::MissingCoordinate {
+                            path: path.to_path_buf(),
+                            format_candidate: Some(detection.format.clone()),
+                            row: source_row,
+                            column: column + 1,
+                            diagnostics,
+                        });
+                    }
+                    diagnostics.push(
+                        diagnostic(
+                            path,
+                            worksheet,
+                            &detection.format,
+                            options,
+                            Severity::Warning,
+                            DiagnosticCode::MissingValue,
+                            "missing coordinate caused the source row to be skipped",
+                        )
+                        .at(source_row, Some(column + 1))
+                        .for_column(column_label(columns, column))
+                        .recovered(RecoveryAction::RowSkipped),
+                    );
+                    skip_row = true;
+                } else if column < source_cell_count {
+                    diagnostics.push(
+                        diagnostic(
+                            path,
+                            worksheet,
+                            &detection.format,
+                            options,
+                            Severity::Warning,
+                            DiagnosticCode::MissingValue,
+                            "missing numeric cell preserved as null",
+                        )
+                        .at(source_row, Some(column + 1))
+                        .for_column(column_label(columns, column))
+                        .with_token(value)
+                        .recovered(RecoveryAction::Preserved),
+                    );
+                }
+                decoded_row.push(None);
+            } else {
+                let parsed_result = value.parse::<f64>();
+                let parse_source = parsed_result.as_ref().err().cloned();
+                let parsed = parsed_result.ok().filter(|number| number.is_finite());
+                if let Some(parsed) = parsed {
+                    decoded_row.push(Some(parsed));
+                } else if coordinate {
+                    if options.invalid_time_policy == InvalidTimePolicy::Error {
+                        return Err(Error::MalformedNumeric {
+                            path: path.to_path_buf(),
+                            format_candidate: Some(detection.format.clone()),
+                            row: source_row,
+                            column: column + 1,
+                            value: value.into(),
+                            diagnostics,
+                            source: parse_source,
+                        });
+                    }
+                    diagnostics.push(
+                        diagnostic(
+                            path,
+                            worksheet,
+                            &detection.format,
+                            options,
+                            Severity::Warning,
+                            DiagnosticCode::MalformedTimestamp,
+                            "malformed coordinate caused the source row to be skipped",
+                        )
+                        .at(source_row, Some(column + 1))
+                        .for_column(column_label(columns, column))
+                        .with_token(value)
+                        .recovered(RecoveryAction::RowSkipped),
+                    );
+                    decoded_row.push(None);
+                    skip_row = true;
+                } else if options.invalid_cell_policy == InvalidCellPolicy::Error {
+                    return Err(Error::MalformedNumeric {
+                        path: path.to_path_buf(),
+                        format_candidate: Some(detection.format.clone()),
+                        row: source_row,
+                        column: column + 1,
+                        value: value.into(),
+                        diagnostics,
+                        source: parse_source,
+                    });
+                } else {
+                    diagnostics.push(
+                        diagnostic(
+                            path,
+                            worksheet,
+                            &detection.format,
+                            options,
+                            Severity::Warning,
+                            DiagnosticCode::MalformedNumeric,
+                            "malformed measurement cell replaced with null",
+                        )
+                        .at(source_row, Some(column + 1))
+                        .for_column(column_label(columns, column))
+                        .with_token(value)
+                        .recovered(RecoveryAction::ValueReplacedWithMissing),
+                    );
+                    diagnostics.push(
+                        diagnostic(
+                            path,
+                            worksheet,
+                            &detection.format,
+                            options,
+                            Severity::Warning,
+                            DiagnosticCode::ValueReplacedWithMissing,
+                            "invalid value was replaced with a missing cell",
+                        )
+                        .at(source_row, Some(column + 1))
+                        .for_column(column_label(columns, column))
+                        .with_token(value)
+                        .recovered(RecoveryAction::ValueReplacedWithMissing),
+                    );
+                    decoded_row.push(None);
+                }
+            }
+        }
+        if skip_row {
+            if !diagnostics
+                .iter()
+                .rev()
+                .any(|item| item.row == Some(source_row) && item.code == DiagnosticCode::RowSkipped)
+            {
+                let coordinate_index = columns
+                    .iter()
+                    .position(|descriptor| is_coordinate(&descriptor.role))
+                    .unwrap_or(0);
+                diagnostics.push(
+                    diagnostic(
+                        path,
+                        worksheet,
+                        &detection.format,
+                        options,
+                        Severity::Warning,
+                        DiagnosticCode::RowSkipped,
+                        "invalid coordinate row skipped",
+                    )
+                    .at(source_row, Some(coordinate_index + 1))
+                    .for_column(column_label(columns, coordinate_index))
+                    .recovered(RecoveryAction::RowSkipped),
+                );
+            }
+            continue;
+        }
+        for (column, value) in decoded_row.into_iter().enumerate() {
+            values[column].push(value);
+        }
+        source_rows.push(source_row);
     }
     if values.first().is_none_or(Vec::is_empty) {
         return Err(Error::EmptyData);
     }
     let polars_columns: Vec<Column> = columns
         .iter()
-        .zip(values)
-        .map(|(descriptor, values)| {
+        .zip(&values)
+        .enumerate()
+        .map(|(index, (descriptor, values))| {
             let name = match naming {
+                ColumnNamePolicy::Canonical
+                    if options.effective_profile() == crate::ReadProfile::Compatibility
+                        && detection.format == crate::FormatId::RegularXy
+                        && columns.len() == 2 =>
+                {
+                    if index == 0 {
+                        "x"
+                    } else {
+                        "y"
+                    }
+                }
                 ColumnNamePolicy::Canonical => &descriptor.canonical_name,
                 ColumnNamePolicy::PreserveSource if !descriptor.source_name.is_empty() => {
                     &descriptor.source_name
                 }
                 ColumnNamePolicy::PreserveSource => &descriptor.canonical_name,
             };
-            Column::new(name.clone().into(), values)
+            Column::new(name.into(), values.clone())
         })
         .collect();
-    Ok(DataFrame::new_infer_height(polars_columns)?)
+    Ok(DecodedTable {
+        data: DataFrame::new_infer_height(polars_columns)?,
+        values,
+        source_rows,
+        source_data_row_count,
+        diagnostics,
+    })
+}
+
+fn is_coordinate(role: &ColumnRole) -> bool {
+    matches!(role, ColumnRole::Time | ColumnRole::Frequency)
+}
+
+fn is_missing_token(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "na" | "n/a" | "nan" | "null" | "missing"
+    )
+}
+
+fn column_label(columns: &[crate::ColumnDescriptor], index: usize) -> String {
+    columns
+        .get(index)
+        .map(|descriptor| {
+            if descriptor.source_name.is_empty() {
+                descriptor.canonical_name.clone()
+            } else {
+                descriptor.source_name.clone()
+            }
+        })
+        .unwrap_or_else(|| format!("column_{}", index + 1))
+}
+
+fn diagnostic(
+    path: &Path,
+    worksheet: Option<&str>,
+    format: &crate::FormatId,
+    options: &ReadOptions,
+    severity: Severity,
+    code: DiagnosticCode,
+    message: impl Into<String>,
+) -> Diagnostic {
+    Diagnostic::new(severity, code, message).with_context(
+        path,
+        worksheet,
+        format,
+        options.effective_profile(),
+    )
+}
+
+fn validate_coordinate_order(
+    path: &Path,
+    dataset: &Dataset,
+    options: &ReadOptions,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<()> {
+    match dataset.kind() {
+        crate::DatasetKind::TimeSeries => validate_time_order(path, dataset, options, diagnostics),
+        crate::DatasetKind::ImpedanceSpectrum => {
+            validate_frequency_order(path, dataset, options, diagnostics)
+        }
+        crate::DatasetKind::GenericTable => Ok(()),
+    }
+}
+
+fn validate_time_order(
+    path: &Path,
+    dataset: &Dataset,
+    options: &ReadOptions,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<()> {
+    let values = dataset.f64_values(&ColumnRole::Time)?;
+    let column = dataset
+        .columns
+        .iter()
+        .position(|descriptor| descriptor.role == ColumnRole::Time)
+        .unwrap_or(0);
+    let mut previous = None;
+    for (index, value) in values.iter().copied().enumerate() {
+        let Some(value) = value else { continue };
+        let Some(before) = previous else {
+            previous = Some(value);
+            continue;
+        };
+        let code = if value == before {
+            Some(DiagnosticCode::DuplicateTimestamp)
+        } else if value < before {
+            Some(DiagnosticCode::NonMonotonicTimestamp)
+        } else {
+            None
+        };
+        if let Some(code) = code {
+            let row = dataset.source_row(index).unwrap_or(index + 1);
+            if options.coordinate_order_policy == CoordinateOrderPolicy::Error {
+                let common = (
+                    path.to_path_buf(),
+                    Some(dataset.format.clone()),
+                    ColumnRole::Time,
+                    row,
+                    column + 1,
+                    diagnostics.clone(),
+                );
+                return if code == DiagnosticCode::DuplicateTimestamp {
+                    Err(Error::DuplicateCoordinate {
+                        path: common.0,
+                        format_candidate: common.1,
+                        role: common.2,
+                        row: common.3,
+                        column: common.4,
+                        diagnostics: common.5,
+                    })
+                } else {
+                    Err(Error::NonMonotonicCoordinate {
+                        path: common.0,
+                        format_candidate: common.1,
+                        role: common.2,
+                        row: common.3,
+                        column: common.4,
+                        diagnostics: common.5,
+                    })
+                };
+            }
+            diagnostics.push(
+                diagnostic(
+                    path,
+                    dataset.metadata.provenance.worksheet.as_deref(),
+                    &dataset.format,
+                    options,
+                    Severity::Warning,
+                    code,
+                    if code == DiagnosticCode::DuplicateTimestamp {
+                        "duplicate timestamp preserved in source order"
+                    } else {
+                        "decreasing timestamp preserved in source order"
+                    },
+                )
+                .at(row, Some(column + 1))
+                .for_column(column_label(&dataset.columns, column))
+                .recovered(RecoveryAction::Preserved),
+            );
+        }
+        previous = Some(value);
+    }
+    Ok(())
+}
+
+fn validate_frequency_order(
+    path: &Path,
+    dataset: &Dataset,
+    options: &ReadOptions,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<()> {
+    let values = dataset.f64_values(&ColumnRole::Frequency)?;
+    let column = dataset
+        .columns
+        .iter()
+        .position(|descriptor| descriptor.role == ColumnRole::Frequency)
+        .unwrap_or(0);
+    let direction = values.windows(2).find_map(|pair| match (pair[0], pair[1]) {
+        (Some(left), Some(right)) if left != right => Some(right.total_cmp(&left)),
+        _ => None,
+    });
+    let mut previous = None;
+    for (index, value) in values.iter().copied().enumerate() {
+        let Some(value) = value else { continue };
+        let row = dataset.source_row(index).unwrap_or(index + 1);
+        let invalid = value <= 0.0;
+        let duplicate = previous == Some(value);
+        let reversal = previous.is_some_and(|before| {
+            direction.is_some_and(|expected| value.total_cmp(&before) != expected) && !duplicate
+        });
+        if invalid || duplicate || reversal {
+            if options.coordinate_order_policy == CoordinateOrderPolicy::Error {
+                return if duplicate {
+                    Err(Error::DuplicateCoordinate {
+                        path: path.to_path_buf(),
+                        format_candidate: Some(dataset.format.clone()),
+                        role: ColumnRole::Frequency,
+                        row,
+                        column: column + 1,
+                        diagnostics: diagnostics.clone(),
+                    })
+                } else {
+                    Err(Error::NonMonotonicCoordinate {
+                        path: path.to_path_buf(),
+                        format_candidate: Some(dataset.format.clone()),
+                        role: ColumnRole::Frequency,
+                        row,
+                        column: column + 1,
+                        diagnostics: diagnostics.clone(),
+                    })
+                };
+            }
+            diagnostics.push(
+                diagnostic(
+                    path,
+                    dataset.metadata.provenance.worksheet.as_deref(),
+                    &dataset.format,
+                    options,
+                    if invalid {
+                        Severity::Error
+                    } else {
+                        Severity::Warning
+                    },
+                    if invalid {
+                        DiagnosticCode::NonPositiveFrequency
+                    } else {
+                        DiagnosticCode::NonMonotonicFrequency
+                    },
+                    if invalid {
+                        "non-positive frequency preserved by compatibility policy"
+                    } else {
+                        "nonmonotonic frequency preserved in source order"
+                    },
+                )
+                .at(row, Some(column + 1))
+                .for_column(column_label(&dataset.columns, column))
+                .recovered(RecoveryAction::Preserved),
+            );
+        }
+        previous = Some(value);
+    }
+    Ok(())
+}
+
+struct MetadataContext<'a> {
+    path: &'a Path,
+    probe: &'a Probe,
+    detection: &'a Detection,
+    options: &'a ReadOptions,
+    descriptors: &'a [crate::ColumnDescriptor],
+    formula_cells: &'a [FormulaCell],
+    encoding: Option<TextEncoding>,
+    source_sha256: String,
 }
 
 fn parse_metadata(
-    path: &Path,
-    probe: &Probe,
     rows: &[Vec<String>],
     raw_rows: &[String],
-    detection: &Detection,
+    context: MetadataContext<'_>,
 ) -> Metadata {
+    let MetadataContext {
+        path,
+        probe,
+        detection,
+        options,
+        descriptors,
+        formula_cells,
+        encoding,
+        source_sha256,
+    } = context;
     let range = detection.layout.metadata_range.clone().unwrap_or(0..0);
     let mut acquisition = AcquisitionMetadata::default();
     let mut parameters = Vec::new();
@@ -412,6 +1132,37 @@ fn parse_metadata(
             source_name: probe.source_name.clone(),
             container: probe.container,
             worksheet: probe.worksheet_name.clone(),
+            delimiter: probe.delimiter.map(char::from),
+            encoding,
+            detected_format: detection.format.clone(),
+            detection_confidence: detection.confidence,
+            detection_evidence: detection.evidence.clone(),
+            read_options: options.normalized_for_provenance(),
+            source_columns: descriptors
+                .iter()
+                .enumerate()
+                .map(|(index, descriptor)| SourceColumnProvenance {
+                    position: index + 1,
+                    source_name: descriptor.source_name.clone(),
+                    canonical_name: descriptor.canonical_name.clone(),
+                    role: descriptor.role.clone(),
+                    unit: descriptor.unit.clone().unwrap_or(Unit::Unknown),
+                })
+                .collect(),
+            formulas: formula_cells
+                .iter()
+                .map(|formula| FormulaProvenance {
+                    row: formula.row,
+                    column: formula.column,
+                    formula: formula.formula.clone(),
+                    cache_status: if formula.usable_numeric_cache {
+                        FormulaCacheStatus::UsableNumeric
+                    } else {
+                        FormulaCacheStatus::Unusable
+                    },
+                })
+                .collect(),
+            source_sha256,
         },
     }
 }

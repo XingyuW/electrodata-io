@@ -1,4 +1,4 @@
-use crate::reader::{DataReader, SourceData};
+use crate::reader::{DataReader, FormulaCell, SourceData};
 use crate::source::{ContainerFormat, Probe};
 use crate::{DetectionResult, Error, ReadOptions, Result, SheetSelector};
 use calamine::{Data, Reader, open_workbook_auto};
@@ -9,6 +9,7 @@ struct SheetData {
     rows: Vec<Vec<String>>,
     raw_rows: Vec<String>,
     probe: Probe,
+    formula_cells: Vec<FormulaCell>,
 }
 
 /// Detects a format using the same worksheet selection policy as workbook reads.
@@ -20,23 +21,31 @@ pub(crate) fn detect(
 ) -> Result<DetectionResult> {
     let mut workbook = open_workbook_auto(path).map_err(|error| Error::WorkbookOpening {
         path: path.to_path_buf(),
-        message: error.to_string(),
+        source: Box::new(error),
     })?;
     let names = workbook.sheet_names();
     let selected_names: Vec<String> = match &options.sheet {
         SheetSelector::Auto => names,
         SheetSelector::Name(name) => {
             if !names.iter().any(|candidate| candidate == name) {
-                return Err(Error::MissingWorksheet(name.clone()));
+                return Err(Error::MissingWorksheet {
+                    path: path.to_path_buf(),
+                    worksheet: name.clone(),
+                });
             }
             vec![name.clone()]
         }
-        SheetSelector::Index(index) => vec![
-            names
-                .get(*index)
-                .cloned()
-                .ok_or_else(|| Error::MissingWorksheet(format!("index {index}")))?,
-        ],
+        SheetSelector::Index(index) => {
+            vec![
+                names
+                    .get(*index)
+                    .cloned()
+                    .ok_or_else(|| Error::MissingWorksheet {
+                        path: path.to_path_buf(),
+                        worksheet: format!("index {index}"),
+                    })?,
+            ]
+        }
     };
     let source_name = path
         .file_name()
@@ -47,7 +56,10 @@ pub(crate) fn detect(
     for name in selected_names {
         let range = workbook
             .worksheet_range(&name)
-            .map_err(|error| Error::Calamine(error.to_string()))?;
+            .map_err(|error| Error::Calamine {
+                path: path.to_path_buf(),
+                source: Box::new(error),
+            })?;
         if range.is_empty() {
             continue;
         }
@@ -65,7 +77,8 @@ pub(crate) fn detect(
             container,
             worksheet_name: Some(name),
         };
-        if let Ok(result) = reader.detect_probe(path, &probe, options) {
+        if let Ok(mut result) = reader.detect_probe(path, &probe, options) {
+            result.worksheet = probe.worksheet_name.clone();
             candidates.push(result);
         }
     }
@@ -81,6 +94,7 @@ pub(crate) fn detect(
         .is_some_and(|second| (candidates[0].confidence - second.confidence).abs() < f32::EPSILON)
     {
         return Err(Error::AmbiguousDetection {
+            path: path.to_path_buf(),
             candidates: candidates.into_iter().take(3).collect(),
         });
     }
@@ -99,25 +113,38 @@ pub(crate) fn read(
     container: ContainerFormat,
     options: &ReadOptions,
 ) -> Result<crate::Dataset> {
+    let source_bytes = std::fs::read(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let source_sha256 = crate::source::sha256_hex(&source_bytes);
     let mut workbook = open_workbook_auto(path).map_err(|error| Error::WorkbookOpening {
         path: path.to_path_buf(),
-        message: error.to_string(),
+        source: Box::new(error),
     })?;
     let names = workbook.sheet_names();
     let selected_names: Vec<String> = match &options.sheet {
         SheetSelector::Auto => names,
         SheetSelector::Name(name) => {
             if !names.iter().any(|candidate| candidate == name) {
-                return Err(Error::MissingWorksheet(name.clone()));
+                return Err(Error::MissingWorksheet {
+                    path: path.to_path_buf(),
+                    worksheet: name.clone(),
+                });
             }
             vec![name.clone()]
         }
-        SheetSelector::Index(index) => vec![
-            names
-                .get(*index)
-                .cloned()
-                .ok_or_else(|| Error::MissingWorksheet(format!("index {index}")))?,
-        ],
+        SheetSelector::Index(index) => {
+            vec![
+                names
+                    .get(*index)
+                    .cloned()
+                    .ok_or_else(|| Error::MissingWorksheet {
+                        path: path.to_path_buf(),
+                        worksheet: format!("index {index}"),
+                    })?,
+            ]
+        }
     };
     let source_name = path
         .file_name()
@@ -128,7 +155,16 @@ pub(crate) fn read(
     for name in selected_names {
         let range = workbook
             .worksheet_range(&name)
-            .map_err(|error| Error::Calamine(error.to_string()))?;
+            .map_err(|error| Error::Calamine {
+                path: path.to_path_buf(),
+                source: Box::new(error),
+            })?;
+        let formulas = workbook
+            .worksheet_formula(&name)
+            .map_err(|error| Error::Calamine {
+                path: path.to_path_buf(),
+                source: Box::new(error),
+            })?;
         if range.is_empty() {
             continue;
         }
@@ -150,14 +186,18 @@ pub(crate) fn read(
             rows,
             raw_rows,
             probe,
+            formula_cells: formula_cells(&range, &formulas),
         });
     }
     if sheets.is_empty() {
-        return Err(Error::EmptyData);
+        return Err(Error::EmptyData.with_read_context(path, None, None));
     }
     if !matches!(options.sheet, SheetSelector::Auto) {
-        let sheet = sheets.into_iter().next().ok_or(Error::EmptyData)?;
-        let (handler, detection) = reader.choose(&sheet.probe, options)?;
+        let sheet = sheets
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::EmptyData.with_read_context(path, None, None))?;
+        let (handler, detection) = reader.choose(path, &sheet.probe, options)?;
         return reader.assemble(
             path,
             SourceData {
@@ -165,6 +205,9 @@ pub(crate) fn read(
                 rows: sheet.rows,
                 raw_rows: sheet.raw_rows,
                 diagnostics: Vec::new(),
+                encoding: None,
+                source_sha256,
+                formula_cells: sheet.formula_cells,
             },
             handler,
             detection,
@@ -173,13 +216,14 @@ pub(crate) fn read(
     }
     let mut candidates = Vec::new();
     for sheet in sheets {
-        if let Ok((handler, detection)) = reader.choose(&sheet.probe, options) {
+        if let Ok((handler, detection)) = reader.choose(path, &sheet.probe, options) {
             candidates.push((sheet, handler, detection));
         }
     }
     candidates.sort_by(|left, right| right.2.confidence.total_cmp(&left.2.confidence));
     if candidates.is_empty() {
         return Err(Error::UnknownFormat {
+            path: path.to_path_buf(),
             best_confidence: 0.0,
             threshold: options.detection_threshold,
         });
@@ -188,6 +232,7 @@ pub(crate) fn read(
         (candidates[0].2.confidence - second.2.confidence).abs() < f32::EPSILON
     }) {
         return Err(Error::AmbiguousFormat {
+            path: path.to_path_buf(),
             candidates: candidates
                 .iter()
                 .take(3)
@@ -211,6 +256,9 @@ pub(crate) fn read(
             rows: sheet.rows,
             raw_rows: sheet.raw_rows,
             diagnostics: Vec::new(),
+            encoding: None,
+            source_sha256,
+            formula_cells: sheet.formula_cells,
         },
         handler,
         detection,
@@ -229,4 +277,30 @@ fn cell_text(cell: &Data) -> String {
         Data::DateTimeIso(value) | Data::DurationIso(value) => value.clone(),
         Data::Error(value) => format!("#{value:?}"),
     }
+}
+
+fn formula_cells(
+    values: &calamine::Range<Data>,
+    formulas: &calamine::Range<String>,
+) -> Vec<FormulaCell> {
+    let Some((start_row, start_column)) = formulas.start() else {
+        return Vec::new();
+    };
+    formulas
+        .used_cells()
+        .filter(|(_, _, formula)| !formula.is_empty())
+        .map(|(row, column, formula)| {
+            let absolute = (start_row + row as u32, start_column + column as u32);
+            let usable_numeric_cache = matches!(
+                values.get_value(absolute),
+                Some(Data::Int(_) | Data::Float(_))
+            );
+            FormulaCell {
+                row: absolute.0 as usize + 1,
+                column: absolute.1 as usize + 1,
+                formula: formula.clone(),
+                usable_numeric_cache,
+            }
+        })
+        .collect()
 }
