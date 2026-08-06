@@ -1,5 +1,5 @@
 #![cfg_attr(not(any(feature = "csv", feature = "excel")), allow(dead_code))]
-//! Extensible, lossless readers for electrochemical and scientific tabular data.
+//! Canonical input and physical-data representations for electrochemical tables.
 //!
 //! [`read`] is the convenient entry point. Use [`DataReader`] when registering
 //! an application- or instrument-specific [`FormatHandler`].
@@ -16,26 +16,40 @@ mod schema;
 mod source;
 mod validation;
 
-pub use dataset::Dataset;
+pub use dataset::{Dataset, EisView, TimeSeriesView};
 pub use detection::{DetectionResult, ElectroDataFormat};
-pub use diagnostics::{Diagnostic, DiagnosticCode, Severity};
-pub use error::{Error, Result};
+pub use diagnostics::{
+    ColumnMissingCount, Diagnostic, DiagnosticCode, DiagnosticSummary, Diagnostics, RecoveryAction,
+    Severity,
+};
+pub use error::{
+    EisSchemaError, Error, ErrorCategory, ErrorContext, Result, UnitErrorContext,
+    WorksheetCandidate,
+};
 pub use formats::{DetectedLayout, Detection, FormatHandler, FormatId};
 pub use metadata::{
-    AcquisitionMetadata, Metadata, MetadataValue, Parameter, Provenance, RawMetadataRow,
+    AcquisitionMetadata, FormulaCacheStatus, FormulaProvenance, Metadata, MetadataValue, Parameter,
+    Provenance, RawMetadataRow, SourceColumnProvenance, TextEncoding,
 };
 pub use options::{
-    ColumnNamePolicy, HeaderPolicy, ReadOptions, SheetSelector, ValidationLevel,
+    ColumnNamePolicy, CoordinateOrderPolicy, HeaderPolicy, InvalidCellPolicy, InvalidTimePolicy,
+    RaggedRowPolicy, ReadOptions, ReadProfile, SheetSelector, ValidationLevel,
     ValidationTolerances,
 };
 pub use reader::{DataReader, DataReaderBuilder};
-pub use schema::{ColumnDescriptor, ColumnRole, Unit};
+pub use schema::{
+    Column, ColumnDescriptor, ColumnRole, ConvertedValues, DatasetKind, DatasetSchema, Unit,
+    UnitConversion,
+};
 pub use source::{ContainerFormat, Probe};
 
 use std::path::Path;
 
 /// Backwards-compatible name for the crate's structured error type.
 pub type ElectroDataError = Error;
+
+/// Canonical name for the crate's retained source metadata.
+pub type DatasetMetadata = Metadata;
 
 /// Detects a built-in scientific format from a bounded source preview.
 ///
@@ -60,9 +74,7 @@ pub fn read<P>(path: P) -> std::result::Result<Dataset, ElectroDataError>
 where
     P: AsRef<Path>,
 {
-    let path = path.as_ref();
-    let detection = detect_format(path)?;
-    read_as(path, detection.format)
+    read_with_options(path, &ReadOptions::new())
 }
 
 /// Reads a file with an explicitly selected built-in scientific format.
@@ -80,12 +92,13 @@ where
     read_with_options(path, &options)
 }
 
-/// Reads a regular two-column scientific table directly.
+/// Reads a generalized regular table through the legacy compatibility entry point.
 pub fn read_regular<P>(path: P) -> std::result::Result<Dataset, ElectroDataError>
 where
     P: AsRef<Path>,
 {
-    read_as(path, ElectroDataFormat::Regular)
+    let options = ReadOptions::compatibility().with_format(FormatId::RegularXy);
+    read_with_options(path, &options)
 }
 
 /// Reads a CHI open-circuit-potential table directly.
@@ -93,7 +106,10 @@ pub fn read_chi_ocpt<P>(path: P) -> std::result::Result<Dataset, ElectroDataErro
 where
     P: AsRef<Path>,
 {
-    read_as(path, ElectroDataFormat::ChiOcpt)
+    read_with_options(
+        path,
+        &ReadOptions::compatibility().with_format(FormatId::ChiOcpt),
+    )
 }
 
 /// Reads a CHI numbered-channel open-circuit-potential table directly.
@@ -101,7 +117,10 @@ pub fn read_chi_multichannel_ocpt<P>(path: P) -> std::result::Result<Dataset, El
 where
     P: AsRef<Path>,
 {
-    read_as(path, ElectroDataFormat::ChiMultichannelOcpt)
+    read_with_options(
+        path,
+        &ReadOptions::compatibility().with_format(FormatId::ChiMultichannelOcpt),
+    )
 }
 
 /// Reads a CHI A.C. impedance table directly.
@@ -109,7 +128,10 @@ pub fn read_chi_eis<P>(path: P) -> std::result::Result<Dataset, ElectroDataError
 where
     P: AsRef<Path>,
 {
-    read_as(path, ElectroDataFormat::ChiEis)
+    read_with_options(
+        path,
+        &ReadOptions::compatibility().with_format(FormatId::ChiEis),
+    )
 }
 
 /// Reads a supported file with explicit options.

@@ -1,9 +1,11 @@
 # electrodata-io
 
-`electrodata-io` is a reusable Rust library for reading electrochemical and
-scientific tables into Polars. Storage detection (CSV or Excel) is independent
-from scientific-format detection, and new scientific formats are registered as
-object-safe handlers instead of being added to a central dispatch `match`.
+`electrodata-io` is the canonical input and physical-data representation crate
+for electrochemical and scientific tables. Its primary API is a stable,
+null-aware `Dataset`/`Column` model; callers do not need Polars. Storage
+detection (delimited text or Excel) is independent from scientific-format
+detection, and new scientific formats remain registerable through object-safe
+handlers.
 
 The crate preserves source order, duplicate samples, numeric signs, raw
 metadata, and original headers. It never sorts, deduplicates, resamples,
@@ -15,7 +17,8 @@ interpolates, corrects units, or replaces measured values with derived values.
 use electrodata_io::read;
 
 let dataset = read("experiment.csv")?;
-println!("{} rows", dataset.data.height());
+println!("kind={:?}", dataset.kind());
+println!("{} rows", dataset.f64_values(&ColumnRole::Time)?.len());
 # Ok::<(), electrodata_io::Error>(())
 ```
 
@@ -29,7 +32,7 @@ use electrodata_io::{detect_format, read};
 let detection = detect_format("measurement.csv")?;
 println!("Detected format: {:?} ({:.0}% confidence)", detection.format, detection.confidence * 100.0);
 let dataset = read("measurement.csv")?;
-println!("{:?}", dataset.data);
+println!("{:?}", dataset.schema);
 # Ok::<(), electrodata_io::Error>(())
 ```
 
@@ -43,14 +46,38 @@ let dataset = read_as("measurement.csv", ElectroDataFormat::ChiEis)?;
 # Ok::<(), electrodata_io::Error>(())
 ```
 
-`Dataset::data` is an ordinary Polars `DataFrame`:
+Canonical columns retain their source names, roles, units, and null-aware
+physical values:
 
 ```rust,no_run
-let dataset = electrodata_io::read("experiment.csv")?;
-let frame = &dataset.data;
-println!("{:?}", frame.schema());
+use electrodata_io::{ColumnRole, read};
+
+let dataset = read("experiment.csv")?;
+let view = dataset.time_series_view()?;
+println!("{} samples, {} measurements", view.coordinate_values().len(), view.measurements.len());
+println!("source coordinate: {:?}", view.coordinate_values());
+println!("normalized seconds: {:?}", view.normalized_seconds());
 # Ok::<(), electrodata_io::Error>(())
 ```
+
+### Time coordinates and units
+
+The canonical model keeps three distinct concepts separate:
+
+- **Raw coordinate values** are the original decoded numbers and are available
+  through `Dataset::coordinate_values()` or `TimeSeriesView::coordinate_values()`.
+- A **physical time coordinate** exists only when the source establishes a
+  recognized time unit; inspect it with `coordinate_unit()`.
+- **Normalized seconds** are available from `TimeSeriesView::normalized_seconds()`
+  only for recognized time units. `Dataset::time_seconds()` performs the same
+  conversion but returns a structured unit error when it is unavailable.
+
+For headerless tables, the first numeric column may be inferred as the `Time`
+role while its source unit remains `Unit::Unknown`. Its numeric coordinates are
+still accessible; they are never silently treated as seconds.
+
+`Dataset::data` and `Dataset::column_by_role` remain available as Polars
+compatibility/advanced escape hatches, but are not required by ordinary callers.
 
 Typed and raw metadata are both retained:
 
@@ -68,8 +95,8 @@ Semantic accessors are independent of displayed column names:
 ```rust,no_run
 use electrodata_io::ColumnRole;
 let dataset = electrodata_io::read("Multichannel_OCPT.csv")?;
-let time = dataset.column_by_role(&ColumnRole::Time)?;
-let channel_five = dataset.channel(5)?;
+let time = dataset.f64_values(&ColumnRole::Time)?;
+let channel_five = dataset.f64_values(&ColumnRole::MeasurementChannel(5))?;
 # Ok::<(), electrodata_io::Error>(())
 ```
 
@@ -78,12 +105,71 @@ EIS roles preserve the recorded imaginary sign and measured values:
 ```rust,no_run
 use electrodata_io::ColumnRole;
 let dataset = electrodata_io::read("EIS.csv")?;
-let frequency = dataset.column_by_role(&ColumnRole::Frequency)?;
-let z_imaginary = dataset.column_by_role(&ColumnRole::ImpedanceImaginary)?;
+let view = dataset.eis_view()?;
+let frequency = &view.frequency.values;
+let z_imaginary = &view.imaginary.values;
+let magnitude = view.magnitude_values(); // derived only when the source column is absent
 # Ok::<(), electrodata_io::Error>(())
 ```
 
 ## Options
+
+`ReadOptions::new()` is strict. Recovery is explicit and every tolerated issue
+is represented by a source-located diagnostic:
+
+```rust,no_run
+use electrodata_io::{
+    InvalidCellPolicy, InvalidTimePolicy, RaggedRowPolicy, ReadOptions,
+    read_with_options,
+};
+
+let options = ReadOptions::new()
+    .with_invalid_time_policy(InvalidTimePolicy::SkipRow)
+    .with_invalid_cell_policy(InvalidCellPolicy::Null)
+    .with_ragged_row_policy(RaggedRowPolicy::PadNulls);
+let dataset = read_with_options("legacy.dat", &options)?;
+for diagnostic in &dataset.diagnostics {
+    println!("{:?} row={:?}: {}", diagnostic.code, diagnostic.row, diagnostic.message);
+}
+# Ok::<(), electrodata_io::Error>(())
+```
+
+`ReadOptions::compatibility()` selects the complete compatibility profile,
+including preservation of duplicate/nonmonotonic coordinates. No recovery
+sorts, deduplicates, interpolates, changes units, or replaces measured EIS
+fields.
+
+### 0.2 migration
+
+The canonical-read API is planned for `0.2.0`, a breaking minor release in the
+pre-1.0 series. Construct options through builders instead of a public struct
+literal:
+
+```rust
+use electrodata_io::{InvalidCellPolicy, ReadOptions};
+
+let options = ReadOptions::new()
+    .with_invalid_cell_policy(InvalidCellPolicy::Null);
+```
+
+Inspect errors through their stable structured accessors instead of relying on
+the field shape of a particular variant:
+
+```rust,no_run
+let error = electrodata_io::read("measurement.csv").unwrap_err();
+let context = error.context();
+eprintln!("{:?} {:?}:{:?}", context.category, context.row, context.column);
+```
+
+`Error`, `ReadOptions`, and `ColumnRole` are non-exhaustive for downstream
+matching/construction. Safe legacy runtime surfaces remain: the direct built-in
+readers, `Dataset::data`, `Dataset::columns`, `ColumnRole::Phase`, and
+`ColumnRole::PotentialChannel(n)`. Alias variants retain equality semantics but
+not identical Rust pattern or serde representations.
+
+Legacy OLE `.xls` workbooks return a structured `UnsupportedContainer` error.
+Use `.xlsx` for workbook input; text `.dat` files continue to be recognized by
+content rather than extension alone.
 
 Select an Excel worksheet:
 
@@ -93,6 +179,29 @@ let options = ReadOptions::new().with_sheet(SheetSelector::Name("Experiment 2".i
 let dataset = read_with_options("workbook.xlsx", &options)?;
 # Ok::<(), electrodata_io::Error>(())
 ```
+
+### XLSX preambles and table headers
+
+For workbook sheets, the reader examines a bounded preview for a semantic time
+header followed by consistently shaped numeric rows. This permits acquisition
+notes and blank rows before a normal table without relying on a fixed number of
+rows to skip. The rows before the discovered header are retained in
+`metadata.raw_rows`, and dataset row provenance remains the original worksheet
+row number. A sheet with no compatible semantic table header is rejected rather
+than guessed.
+
+### XLSX error context
+
+Worksheet selection failures (missing, ambiguous, or no compatible worksheet)
+occur before a singular worksheet has been resolved. Once an XLSX worksheet is
+resolved, every later content/parsing/validation failure is returned through
+the public `Error` API with the workbook path, worksheet name, and zero-based
+worksheet index where available. The original structured parser error remains
+the error source; callers can inspect `error.context()`, `error.worksheet()`,
+`error.worksheet_index()`, row/column accessors, and `error.source_error()`
+without decoding display text or diagnostics. Typed-view failures after
+`Dataset` creation use the worksheet provenance retained in the dataset and
+preserve the same context.
 
 Force a format or preserve source headers:
 
@@ -153,7 +262,7 @@ No existing handler or central dispatch table changes are needed.
 ## Features
 
 - `csv` (default): delimited UTF-8 input
-- `excel` (default): XLSX, XLS, XLSB, and ODS through Calamine
+- `excel` (default): `.xlsx` compatible time-series worksheets through Calamine
 - `scientific-validation` (default): domain diagnostics
 - `serde`: serialization for metadata, options, diagnostics, and schema types;
   `DataFrame` serialization is deliberately independent
@@ -332,7 +441,7 @@ use electrodata_io::{read, ColumnRole};
 let dataset = read("EIS.csv")?;
 let frequency = dataset.column_by_role(&ColumnRole::Frequency)?.f64()?;
 let imaginary = dataset.column_by_role(&ColumnRole::ImpedanceImaginary)?.f64()?;
-let phase = dataset.column_by_role(&ColumnRole::Phase)?.f64()?;
+let phase = dataset.column_by_role(&ColumnRole::ImpedancePhase)?.f64()?;
 println!("first frequency: {:?} Hz", frequency.get(0));
 println!("first imaginary impedance: {:?} ohm", imaginary.get(0));
 println!("first phase: {:?} degrees", phase.get(0));
@@ -399,8 +508,9 @@ timezone. Bare flags such as `Imp SF` are retained as parameters.
 ## Validation and diagnostics
 
 Structural validation is enabled by default. It checks nonempty data, consistent
-row widths, required roles, numeric columns, and columns that are entirely
-null. Scientific validation is opt-in:
+row widths, required roles, and numeric columns. Entirely-null required
+coordinate/EIS columns are rejected, while entirely-null auxiliary columns may
+remain. Scientific validation is opt-in:
 
 ```rust,no_run
 use electrodata_io::{read_with_options, ReadOptions, ValidationLevel};
@@ -421,9 +531,13 @@ checks.
 
 ## Excel worksheet selection
 
-Calamine reads XLSX, XLS, XLSB, and ODS workbooks. Automatic selection probes
-nonempty eligible sheets and chooses the strongest format candidate. Select a
-sheet explicitly by name or zero-based index:
+`.xlsx` is supported for compatible time-series worksheets. Legacy OLE `.xls`
+is explicitly unsupported and should be converted to `.xlsx` or a delimited
+text format. Automatic selection probes every nonempty worksheet: it selects
+the worksheet only when exactly one is compatible, and otherwise returns a
+structured worksheet ambiguity error. Detection confidence is retained as
+diagnostic evidence but never breaks a worksheet-selection tie. Select a sheet
+explicitly by name or zero-based index:
 
 ```rust,no_run
 use electrodata_io::{read_with_options, ReadOptions, SheetSelector};
@@ -438,15 +552,15 @@ let second = read_with_options("measurements.xlsx", &by_index)?;
 # Ok::<(), electrodata_io::Error>(())
 ```
 
-Automatic selection returns an ambiguity error when multiple worksheets are
-equally plausible. The selected worksheet is recorded in provenance.
+The selected worksheet is recorded in provenance.
 
 ## Feature selection
 
 Available features are:
 
 - `csv`: CSV, TSV, and delimited text input.
-- `excel`: XLSX, XLS, XLSB, and ODS through Calamine.
+- `excel`: `.xlsx` compatible time-series worksheets through Calamine; legacy
+  OLE `.xls` is explicitly unsupported.
 - `scientific-validation`: OCPT and EIS domain diagnostics.
 - `serde`: serialization for metadata, options, diagnostics, and schema types.
 
@@ -515,12 +629,46 @@ use electrodata_io::{read, Error};
 
 match read("input.csv") {
     Ok(dataset) => println!("loaded {} rows", dataset.data.height()),
-    Err(Error::MalformedNumeric { row, column, value }) => {
+    Err(Error::MalformedNumeric { row, column, value, .. }) => {
         eprintln!("invalid value {value:?} at row {row}, column {column}");
     }
     Err(error) => eprintln!("could not load input: {error}"),
 }
 ```
+
+### Structured EIS failures
+
+Fatal EIS failures remain machine-readable through `read`, `read_with_options`,
+and `Dataset::eis_view()`. Callers can match these public variants:
+
+- `MissingRequiredRole` carries the path, `ChiEis` format candidate, absent
+  role, all detected roles, and source-located `EisSchema` diagnostics.
+- `EisSchemaConflict` carries an `EisSchemaError` with the path, format,
+  one-based header row and column, original header, candidate roles, optional
+  duplicate role, and rejection diagnostics.
+- `UnknownUnit` and `IncompatibleUnit` carry the path, required role, one-based
+  column, original source header, units, and expected target unit where
+  applicable.
+- `InvalidDatasetView` carries the path, requested view, and actual dataset
+  kind. `MissingValue` carries the required role plus dataset/source row and
+  source-column context.
+- Fatal row decoding remains typed as variants such as `MalformedNumeric` and
+  `RaggedRow`, including path, format, row, column, diagnostics, and an
+  underlying source error when one exists.
+
+Fatal errors return `Err(Error)` and prevent construction of an invalid EIS
+dataset. Recoverable conditions return a `Dataset` and remain in
+`Dataset::diagnostics` with a stable `DiagnosticCode`, location, severity, and
+recovery action; diagnostics are never substitutes for fatal schema errors.
+Structural EIS variants are terminal and normally have no `Error::source()`.
+Backend and parsing variants preserve their lower-level error through
+`std::error::Error::source()`.
+
+There is no public `Error` enum layout change for this correction. The only
+runtime compatibility change is for invalid files with an explicit EIS
+technique and a two-column EIS header: they now return
+`MissingRequiredRole` instead of a generic detection or column-signature
+failure. Valid EIS and regular-table parsing are unchanged.
 
 The library does not panic on malformed input. Strict UTF-8 decoding is the
 default; explicitly enabling lossy decoding adds a decoding diagnostic.

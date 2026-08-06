@@ -17,7 +17,7 @@ fn regular_header_and_headerless_keep_all_rows() {
     let with = temp_csv("x,y\n1,2\n3e0,4e0\n");
     let without = temp_csv("1,2\n3e0,4e0\n5,6\n");
     assert_eq!(read(with.path()).unwrap().data.shape(), (2, 2));
-    let dataset = read(without.path()).unwrap();
+    let dataset = read_regular(without.path()).unwrap();
     assert_eq!(dataset.data.shape(), (3, 2));
     assert_eq!(
         dataset.data.column("x").unwrap().f64().unwrap().get(0),
@@ -201,7 +201,7 @@ fn excel_sheet_selection_auto_explicit_and_ambiguous() {
     workbook.save(&ambiguous_path).unwrap();
     assert!(matches!(
         read(&ambiguous_path),
-        Err(Error::AmbiguousDetection { .. }) | Err(Error::AmbiguousFormat { .. })
+        Err(Error::AmbiguousWorksheet { .. })
     ));
 }
 

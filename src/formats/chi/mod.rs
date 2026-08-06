@@ -1,10 +1,23 @@
+use super::regular_xy::{eis_header_candidates, eis_schema_candidate, header_unit};
 use super::{DetectedLayout, Detection, FormatHandler, FormatId, trim_cell};
 use crate::detection::normalize_for_match;
-use crate::{ColumnDescriptor, ColumnRole, Error, Probe, ReadOptions, Unit};
+use crate::{
+    ColumnDescriptor, ColumnRole, Diagnostic, DiagnosticCode, EisSchemaError, Error, Probe,
+    ReadOptions, Severity, Unit,
+};
+use std::path::Path;
 
 pub(crate) struct ChiOcptHandler;
 pub(crate) struct ChiMultichannelOcptHandler;
 pub(crate) struct ChiEisHandler;
+
+/// EIS selection has different evidence requirements when the caller already
+/// selected the format than when the reader is classifying an unknown table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EisDispatchMode {
+    Automatic,
+    Forced,
+}
 
 fn header_key(value: &str) -> String {
     normalize_for_match(trim_cell(value))
@@ -44,6 +57,59 @@ fn header_and_data(probe: &Probe, predicate: impl Fn(&[String]) -> bool) -> Opti
     if following.len() > 1 && !following.iter().all(|(_, row)| numeric_row(row, expected)) {
         return None;
     }
+    Some((header, data))
+}
+
+/// Finds an EIS header and its first non-empty row without requiring the row to
+/// be numerically valid or rectangular. EIS schema evidence is strong enough to
+/// select the handler; the structured decoder must retain malformed-cell and
+/// ragged-row context instead of turning either condition into a detection miss.
+fn eis_header_and_data(
+    probe: &Probe,
+    predicate: impl Fn(&[String]) -> bool,
+) -> Option<(usize, usize)> {
+    let header = probe.rows.iter().position(|row| predicate(row))?;
+    let data = probe
+        .rows
+        .iter()
+        .enumerate()
+        .skip(header + 1)
+        .find(|(_, row)| row.iter().any(|cell| !trim_cell(cell).is_empty()))?
+        .0;
+    Some((header, data))
+}
+
+/// Selects the source header for an explicitly requested EIS read without
+/// applying automatic-detection confidence or completeness requirements.
+///
+/// A row containing any recognized EIS role wins. When no semantic role is
+/// recognized, the first multi-column text row is treated as the header so
+/// `validate_eis_schema` can report the deterministic first missing role with
+/// an empty detected-role collection and the original source headers.
+fn forced_eis_header_and_data(probe: &Probe) -> Option<(usize, usize)> {
+    let header = probe
+        .rows
+        .iter()
+        .position(|row| {
+            row.iter()
+                .any(|value| !eis_header_candidates(value).is_empty())
+        })
+        .or_else(|| {
+            probe.rows.iter().position(|row| {
+                row.len() >= 2
+                    && row.iter().all(|cell| {
+                        let value = trim_cell(cell);
+                        !value.is_empty() && value.parse::<f64>().is_err()
+                    })
+            })
+        })?;
+    let data = probe
+        .rows
+        .iter()
+        .enumerate()
+        .skip(header + 1)
+        .find(|(_, row)| row.iter().any(|cell| !trim_cell(cell).is_empty()))
+        .map_or(header + 1, |(index, _)| index);
     Some((header, data))
 }
 
@@ -124,11 +190,15 @@ impl FormatHandler for ChiOcptHandler {
             .row(detection.layout.header_row.ok_or(Error::HeaderNotFound)?)
             .ok_or(Error::HeaderNotFound)?;
         let potential_role = channel_number(&row[1])
-            .map(ColumnRole::PotentialChannel)
+            .map(ColumnRole::MeasurementChannel)
             .unwrap_or(ColumnRole::Potential);
+        let time_unit = header_unit(&row[0]).unwrap_or(Unit::Unknown);
+        let potential_unit = header_unit(&row[1]).unwrap_or(Unit::Unknown);
+        let time_name = canonical_name("time", &time_unit);
+        let potential_name = canonical_name("potential", &potential_unit);
         Ok(vec![
-            descriptor(&row[0], "time_s", ColumnRole::Time, Unit::Second),
-            descriptor(&row[1], "potential_v", potential_role, Unit::Volt),
+            descriptor(&row[0], &time_name, ColumnRole::Time, time_unit),
+            descriptor(&row[1], &potential_name, potential_role, potential_unit),
         ])
     }
 }
@@ -172,26 +242,28 @@ impl FormatHandler for ChiMultichannelOcptHandler {
         let row = probe
             .row(detection.layout.header_row.ok_or(Error::HeaderNotFound)?)
             .ok_or(Error::HeaderNotFound)?;
+        let time_unit = header_unit(&row[0]).unwrap_or(Unit::Unknown);
         let mut result = vec![descriptor(
             &row[0],
-            "time_s",
+            &canonical_name("time", &time_unit),
             ColumnRole::Time,
-            Unit::Second,
+            time_unit,
         )];
         for value in row.iter().skip(1) {
+            let unit = header_unit(value).unwrap_or(Unit::Unknown);
             if let Some(channel) = channel_number(value) {
                 result.push(descriptor(
                     value,
-                    &format!("ch{channel}_v"),
-                    ColumnRole::PotentialChannel(channel),
-                    Unit::Volt,
+                    &canonical_name(&format!("ch{channel}"), &unit),
+                    ColumnRole::MeasurementChannel(channel),
+                    unit,
                 ));
             } else if is_potential(value) {
                 result.push(descriptor(
                     value,
-                    "potential_v",
+                    &canonical_name("potential", &unit),
                     ColumnRole::Potential,
-                    Unit::Volt,
+                    unit,
                 ));
             } else {
                 return Err(Error::InvalidColumnSignature(value.clone()));
@@ -201,38 +273,198 @@ impl FormatHandler for ChiMultichannelOcptHandler {
     }
 }
 
-fn eis_roles(row: &[String]) -> bool {
-    if row.len() != 5 {
-        return false;
+pub(crate) fn validate_eis_schema(
+    path: &Path,
+    probe: &Probe,
+    detection: &Detection,
+    options: &ReadOptions,
+) -> crate::Result<()> {
+    let header_index = detection.layout.header_row.ok_or(Error::HeaderNotFound)?;
+    let header = probe.row(header_index).ok_or(Error::HeaderNotFound)?;
+    let format_candidate = detection.format.clone();
+    let context = |diagnostic: Diagnostic| {
+        diagnostic.with_context(
+            path,
+            probe.worksheet_name.as_deref(),
+            &format_candidate,
+            options.effective_profile(),
+        )
+    };
+
+    let mut resolved = Vec::with_capacity(header.len());
+    for (index, source) in header.iter().enumerate() {
+        let candidates = eis_header_candidates(source);
+        if candidates.len() > 1 {
+            let diagnostic = context(
+                Diagnostic::new(
+                    Severity::Error,
+                    DiagnosticCode::EisSchema,
+                    "EIS header matches incompatible scientific roles; no positional resolution was applied",
+                )
+                .at(header_index + 1, Some(index + 1))
+                .for_column(trim_cell(source))
+                .with_candidate_roles(candidates.clone())
+                .with_resolution("rejected: ambiguous EIS header"),
+            );
+            return Err(Error::EisSchemaConflict {
+                details: Box::new(EisSchemaError {
+                    path: path.to_path_buf(),
+                    format_candidate,
+                    row: header_index + 1,
+                    column: index + 1,
+                    header: trim_cell(source).to_owned(),
+                    candidate_roles: candidates,
+                    conflicting_role: None,
+                    diagnostics: vec![diagnostic],
+                }),
+            });
+        }
+        resolved.push(candidates.into_iter().next());
     }
-    let values: Vec<String> = row.iter().map(|v| header_key(v)).collect();
-    matches!(values[0].as_str(), "freq/hz" | "frequency/hz")
-        && matches!(values[1].as_str(), "z'/ohm" | "zreal/ohm")
-        && matches!(values[2].as_str(), "z\"/ohm" | "zimag/ohm")
-        && matches!(values[3].as_str(), "z/ohm" | "|z|/ohm")
-        && matches!(values[4].as_str(), "phase/deg" | "phase/degree")
+
+    for role in [
+        ColumnRole::Frequency,
+        ColumnRole::ImpedanceReal,
+        ColumnRole::ImpedanceImaginary,
+        ColumnRole::ImpedanceMagnitude,
+        ColumnRole::ImpedancePhase,
+    ] {
+        let matches: Vec<usize> = resolved
+            .iter()
+            .enumerate()
+            .filter_map(|(index, candidate)| (candidate.as_ref() == Some(&role)).then_some(index))
+            .collect();
+        if matches.len() > 1 {
+            let index = matches[1];
+            let diagnostic = context(
+                Diagnostic::new(
+                    Severity::Error,
+                    DiagnosticCode::EisSchema,
+                    "EIS role occurs in multiple source columns; no first-column fallback was applied",
+                )
+                .at(header_index + 1, Some(index + 1))
+                .for_column(trim_cell(&header[index]))
+                .with_candidate_roles(vec![role.clone()])
+                .with_resolution("rejected: duplicate EIS role"),
+            );
+            return Err(Error::EisSchemaConflict {
+                details: Box::new(EisSchemaError {
+                    path: path.to_path_buf(),
+                    format_candidate,
+                    row: header_index + 1,
+                    column: index + 1,
+                    header: trim_cell(&header[index]).to_owned(),
+                    candidate_roles: vec![role.clone()],
+                    conflicting_role: Some(role),
+                    diagnostics: vec![diagnostic],
+                }),
+            });
+        }
+    }
+
+    for role in [
+        ColumnRole::Frequency,
+        ColumnRole::ImpedanceReal,
+        ColumnRole::ImpedanceImaginary,
+    ] {
+        if !resolved
+            .iter()
+            .any(|candidate| candidate.as_ref() == Some(&role))
+        {
+            let detected_roles = resolved.iter().flatten().cloned().collect();
+            let diagnostic = context(
+                Diagnostic::new(
+                    Severity::Error,
+                    DiagnosticCode::EisSchema,
+                    format!("required EIS role {role:?} is absent from the source header"),
+                )
+                .at(header_index + 1, None)
+                .with_candidate_roles(Vec::new())
+                .with_source_headers(header.to_vec())
+                .with_resolution("rejected: missing required EIS role"),
+            );
+            return Err(Error::MissingRequiredRole {
+                path: path.to_path_buf(),
+                format_candidate,
+                role,
+                detected_roles,
+                diagnostics: vec![diagnostic],
+            });
+        }
+    }
+    Ok(())
 }
 
 impl FormatHandler for ChiEisHandler {
     fn format_id(&self) -> FormatId {
         FormatId::ChiEis
     }
-    fn detect(&self, probe: &Probe, _options: &ReadOptions) -> Option<Detection> {
-        let (_, technique) = technique_row(probe, eis_technique)?;
-        let (header, data) = header_and_data(probe, eis_roles)?;
+    fn detect(&self, probe: &Probe, options: &ReadOptions) -> Option<Detection> {
+        let mode = if options.forced_format.as_ref() == Some(&FormatId::ChiEis) {
+            EisDispatchMode::Forced
+        } else {
+            EisDispatchMode::Automatic
+        };
+        let technique = technique_row(probe, eis_technique).map(|(_, technique)| technique);
+        let (header, data) = match mode {
+            EisDispatchMode::Automatic => eis_header_and_data(probe, |row| {
+                // Preserve automatic confidence requirements: a generic
+                // two-column table with one EIS-like header is not EIS.
+                let explicit_two_column_header = technique.is_some()
+                    && row.len() == 2
+                    && row
+                        .iter()
+                        .any(|value| !eis_header_candidates(value).is_empty());
+                eis_schema_candidate(row)
+                    || (technique.is_some() && row.len() >= 3)
+                    || explicit_two_column_header
+            }),
+            EisDispatchMode::Forced => forced_eis_header_and_data(probe),
+        }?;
+        let header_row = probe.row(header)?;
+        let width = header_row.len();
+        let roles: Vec<_> = header_row
+            .iter()
+            .map(|value| eis_header_candidates(value))
+            .collect();
+        let complete = [
+            ColumnRole::Frequency,
+            ColumnRole::ImpedanceReal,
+            ColumnRole::ImpedanceImaginary,
+        ]
+        .iter()
+        .all(|role| {
+            roles
+                .iter()
+                .filter(|candidates| candidates.as_slice() == [role.clone()])
+                .count()
+                == 1
+        });
         Some(Detection {
             format: FormatId::ChiEis,
-            confidence: eis_confidence(&technique),
+            confidence: match (technique.as_deref(), complete) {
+                (Some(technique), true) => eis_confidence(technique),
+                (Some(_), false) => 0.91,
+                (None, true) => 0.93,
+                (None, false) => 0.89,
+            },
             evidence: vec![
-                format!("EIS technique signature: {technique}"),
-                "frequency, impedance component, magnitude, and phase roles".into(),
+                technique
+                    .map(|value| format!("EIS technique signature: {value}"))
+                    .unwrap_or_else(|| "EIS semantic header without an instrument preamble".into()),
+                if complete {
+                    "frequency and required complex impedance roles resolved independent of position"
+                        .into()
+                } else {
+                    "EIS-like semantic header requires structured required-role validation".into()
+                },
                 format!("matched source header: {}", probe.row(header)?.join(", ")),
             ],
             layout: DetectedLayout {
                 header_row: Some(header),
                 data_start_row: data,
                 metadata_range: Some(0..header),
-                expected_column_count: 5,
+                expected_column_count: width,
                 has_header: true,
             },
         })
@@ -245,18 +477,25 @@ impl FormatHandler for ChiEisHandler {
         let row = probe
             .row(detection.layout.header_row.ok_or(Error::HeaderNotFound)?)
             .ok_or(Error::HeaderNotFound)?;
-        let definitions = [
-            ("frequency_hz", ColumnRole::Frequency, Unit::Hertz),
-            ("z_real_ohm", ColumnRole::ImpedanceReal, Unit::Ohm),
-            ("z_imag_ohm", ColumnRole::ImpedanceImaginary, Unit::Ohm),
-            ("z_magnitude_ohm", ColumnRole::ImpedanceMagnitude, Unit::Ohm),
-            ("phase_deg", ColumnRole::Phase, Unit::Degree),
-        ];
-        Ok(row
-            .iter()
-            .zip(definitions)
-            .map(|(source, (name, role, unit))| descriptor(source, name, role, unit))
-            .collect())
+        row.iter()
+            .map(|source| {
+                let role = eis_header_candidates(source)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(ColumnRole::Unknown);
+                let stem = match role {
+                    ColumnRole::Frequency => "frequency",
+                    ColumnRole::ImpedanceReal => "z_real",
+                    ColumnRole::ImpedanceImaginary => "z_imag",
+                    ColumnRole::ImpedanceMagnitude => "z_magnitude",
+                    ColumnRole::ImpedancePhase => "phase",
+                    ColumnRole::Unknown => "column",
+                    _ => return Err(Error::InvalidColumnSignature(source.clone())),
+                };
+                let unit = header_unit(source).unwrap_or(Unit::Unknown);
+                Ok(descriptor(source, &canonical_name(stem, &unit), role, unit))
+            })
+            .collect()
     }
 }
 
@@ -324,4 +563,22 @@ fn descriptor(source: &str, canonical: &str, role: ColumnRole, unit: Unit) -> Co
         role,
         unit: Some(unit),
     }
+}
+
+fn canonical_name(stem: &str, unit: &Unit) -> String {
+    let suffix = match unit {
+        Unit::Second => "s",
+        Unit::Hour => "h",
+        Unit::Day => "d",
+        Unit::Hertz => "hz",
+        Unit::Ohm => "ohm",
+        Unit::Degree => "deg",
+        Unit::Volt => "v",
+        Unit::Millivolt => "mv",
+        Unit::Ampere => "a",
+        Unit::Milliampere => "ma",
+        Unit::Microampere => "ua",
+        Unit::Unknown | Unit::Other(_) => return stem.into(),
+    };
+    format!("{stem}_{suffix}")
 }

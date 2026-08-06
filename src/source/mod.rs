@@ -34,6 +34,8 @@ pub struct Probe {
     pub container: ContainerFormat,
     /// Workbook member name.
     pub worksheet_name: Option<String>,
+    /// Zero-based workbook member index when this probe came from a worksheet.
+    pub worksheet_index: Option<usize>,
 }
 
 impl Probe {
@@ -47,3 +49,12 @@ impl Probe {
 pub(crate) mod csv_source;
 #[cfg(feature = "excel")]
 pub(crate) mod excel;
+
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}

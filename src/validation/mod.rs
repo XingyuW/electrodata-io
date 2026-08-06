@@ -1,8 +1,8 @@
 //! Non-mutating structural and scientific validation.
 
-#[cfg(feature = "scientific-validation")]
-use crate::{ColumnRole, DiagnosticCode, FormatId, MetadataValue, Severity};
 use crate::{Dataset, Diagnostic, Error, ReadOptions, Result, ValidationLevel};
+#[cfg(feature = "scientific-validation")]
+use crate::{DiagnosticCode, MetadataValue, RecoveryAction, Severity};
 
 pub(crate) fn validate(
     dataset: &Dataset,
@@ -23,25 +23,38 @@ pub(crate) fn validate(
 }
 
 fn structural(dataset: &Dataset) -> Result<()> {
-    if dataset.data.height() == 0 {
+    let Some(first) = dataset.canonical_columns().first() else {
+        return Err(Error::EmptyData);
+    };
+    if first.values.is_empty() {
         return Err(Error::EmptyData);
     }
-    for descriptor in &dataset.columns {
-        let column = dataset.column_by_role(&descriptor.role)?;
-        if column.dtype() != &polars::prelude::DataType::Float64 {
+    let height = first.values.len();
+    for column in dataset.canonical_columns() {
+        if column.values.len() != height {
             return Err(Error::InvalidColumnSignature(format!(
-                "{} is not Float64",
-                descriptor.canonical_name
+                "{} is not aligned to the dataset row count",
+                column.name
             )));
         }
-        if column.null_count() == column.len() {
+        if required_non_null_role(&column.role) && column.values.iter().all(Option::is_none) {
             return Err(Error::InvalidColumnSignature(format!(
                 "{} is entirely null",
-                descriptor.canonical_name
+                column.name
             )));
         }
     }
     Ok(())
+}
+
+fn required_non_null_role(role: &crate::ColumnRole) -> bool {
+    matches!(
+        role,
+        crate::ColumnRole::Time
+            | crate::ColumnRole::Frequency
+            | crate::ColumnRole::ImpedanceReal
+            | crate::ColumnRole::ImpedanceImaginary
+    )
 }
 
 #[cfg(feature = "scientific-validation")]
@@ -50,63 +63,45 @@ fn scientific(
     options: &ReadOptions,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<()> {
-    match dataset.format {
-        FormatId::ChiOcpt | FormatId::ChiMultichannelOcpt => {
-            validate_ocpt(dataset, options, diagnostics)
-        }
-        FormatId::ChiEis => validate_eis(dataset, options, diagnostics),
-        _ => Ok(()),
+    match dataset.kind() {
+        crate::DatasetKind::TimeSeries => validate_duration(dataset, options, diagnostics),
+        crate::DatasetKind::ImpedanceSpectrum => validate_eis(dataset, options, diagnostics),
+        crate::DatasetKind::GenericTable => Ok(()),
     }
 }
 
 #[cfg(feature = "scientific-validation")]
-fn validate_ocpt(
+fn validate_duration(
     dataset: &Dataset,
     options: &ReadOptions,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<()> {
-    let time = dataset.column_by_role(&ColumnRole::Time)?.f64()?;
-    let mut previous = None;
-    let mut last = None;
-    for (index, current) in time.iter().enumerate() {
-        if let Some(current) = current {
-            if !current.is_finite() {
-                diagnostics.push(diagnostic(
-                    Severity::Error,
-                    DiagnosticCode::NonMonotonicTime,
-                    "OCPT time is not finite",
-                    Some(index + 1),
-                    Some("time_s"),
-                ));
-            }
-            if let Some(before) = previous {
-                if current == before {
-                    diagnostics.push(diagnostic(
-                        Severity::Warning,
-                        DiagnosticCode::DuplicateTime,
-                        "duplicate OCPT timestamp preserved",
-                        Some(index + 1),
-                        Some("time_s"),
-                    ));
-                } else if current < before {
-                    diagnostics.push(diagnostic(
-                        Severity::Warning,
-                        DiagnosticCode::NonMonotonicTime,
-                        "OCPT time decreases; source order preserved",
-                        Some(index + 1),
-                        Some("time_s"),
-                    ));
-                }
-            }
-            previous = Some(current);
-            last = Some(current);
-        }
-    }
-    if let (Some(duration), Some(last)) = (run_time(dataset), last) {
-        let relative = (duration - last).abs() / duration.abs().max(f64::EPSILON);
-        if relative > options.tolerances.duration_relative {
-            diagnostics.push(diagnostic(Severity::Warning, DiagnosticCode::DurationMismatch, &format!("observed final time {last} s differs from declared Run Time {duration} s; neither value was modified"), None, Some("time_s")));
-        }
+    let Some(duration) = run_time(dataset) else {
+        return Ok(());
+    };
+    let Some(last) = dataset
+        .f64_values(&crate::ColumnRole::Time)?
+        .iter()
+        .rev()
+        .flatten()
+        .next()
+        .copied()
+    else {
+        return Ok(());
+    };
+    let relative = (duration - last).abs() / duration.abs().max(f64::EPSILON);
+    if relative > options.tolerances.duration_relative {
+        diagnostics.push(contextual_diagnostic(
+            dataset,
+            options,
+            Severity::Warning,
+            DiagnosticCode::DurationMismatch,
+            format!(
+                "observed final time {last} s differs from declared Run Time {duration} s; neither value was modified"
+            ),
+            None,
+            Some("time_s"),
+        ));
     }
     Ok(())
 }
@@ -117,81 +112,85 @@ fn validate_eis(
     options: &ReadOptions,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<()> {
-    let frequency = dataset.column_by_role(&ColumnRole::Frequency)?.f64()?;
-    let real = dataset.column_by_role(&ColumnRole::ImpedanceReal)?.f64()?;
-    let imaginary = dataset
-        .column_by_role(&ColumnRole::ImpedanceImaginary)?
-        .f64()?;
-    let magnitude = dataset
-        .column_by_role(&ColumnRole::ImpedanceMagnitude)?
-        .f64()?;
-    let phase = dataset.column_by_role(&ColumnRole::Phase)?.f64()?;
-    let frequencies: Vec<Option<f64>> = frequency.iter().collect();
-    for (index, value) in frequencies.iter().enumerate() {
-        if value.is_some_and(|number| number <= 0.0) {
-            diagnostics.push(diagnostic(
-                Severity::Error,
-                DiagnosticCode::NonPositiveFrequency,
-                "EIS frequency must be positive",
-                Some(index + 1),
-                Some("frequency_hz"),
-            ));
-        }
-    }
-    let direction = frequencies
-        .windows(2)
-        .filter_map(|pair| Some(pair[1]?.total_cmp(&pair[0]?)))
-        .find(|order| !order.is_eq());
-    if let Some(direction) = direction {
-        let monotonic = frequencies.windows(2).all(|pair| match (pair[0], pair[1]) {
-            (Some(a), Some(b)) => b.total_cmp(&a) == direction || a == b,
-            _ => true,
-        });
-        if !monotonic {
-            diagnostics.push(diagnostic(
-                Severity::Warning,
-                DiagnosticCode::NonMonotonicFrequency,
-                "EIS frequency is not monotonic; source order preserved",
-                None,
-                Some("frequency_hz"),
-            ));
-        }
-    }
-    for index in 0..dataset.data.height() {
-        let Some((zr, zi, measured_magnitude, measured_phase)) = real
-            .get(index)
-            .zip(imaginary.get(index))
-            .zip(magnitude.get(index))
-            .zip(phase.get(index))
-            .map(|(((a, b), c), d)| (a, b, c, d))
-        else {
-            continue;
-        };
-        let calculated_magnitude = zr.hypot(zi);
-        if (measured_magnitude - calculated_magnitude).abs()
-            / calculated_magnitude.max(f64::EPSILON)
-            > options.tolerances.eis_magnitude_relative
+    let view = dataset.eis_view()?;
+    if let Some(measured) = view.measured_magnitude {
+        for (index, (((real, imaginary), measured), source_row)) in view
+            .real
+            .values
+            .iter()
+            .zip(&view.imaginary.values)
+            .zip(&measured.values)
+            .zip((0..).map(|row| dataset.source_row(row)))
+            .enumerate()
         {
-            diagnostics.push(diagnostic(
-                Severity::Warning,
-                DiagnosticCode::MagnitudeMismatch,
-                "measured EIS magnitude differs from component-derived magnitude",
-                Some(index + 1),
-                Some("z_magnitude_ohm"),
-            ));
+            let Some((real, imaginary, measured)) = real
+                .zip(*imaginary)
+                .zip(*measured)
+                .map(|((real, imaginary), measured)| (real, imaginary, measured))
+            else {
+                continue;
+            };
+            let calculated = real.hypot(imaginary);
+            if (measured - calculated).abs() / calculated.max(f64::EPSILON)
+                > options.tolerances.eis_magnitude_relative
+            {
+                diagnostics.push(contextual_diagnostic(
+                    dataset,
+                    options,
+                    Severity::Warning,
+                    DiagnosticCode::MagnitudeMismatch,
+                    "measured EIS magnitude differs from component-derived magnitude",
+                    source_row.or(Some(index + 1)),
+                    Some(&measured_name(
+                        dataset,
+                        crate::ColumnRole::ImpedanceMagnitude,
+                    )),
+                ));
+            }
         }
-        let calculated_phase = zi.atan2(zr).to_degrees();
-        if (measured_phase - calculated_phase).abs() > options.tolerances.eis_phase_degrees {
-            diagnostics.push(diagnostic(
-                Severity::Warning,
-                DiagnosticCode::PhaseMismatch,
-                "measured EIS phase differs from component-derived phase",
-                Some(index + 1),
-                Some("phase_deg"),
-            ));
+    }
+    if let Some(measured) = view.measured_phase {
+        for (index, (((real, imaginary), measured), source_row)) in view
+            .real
+            .values
+            .iter()
+            .zip(&view.imaginary.values)
+            .zip(&measured.values)
+            .zip((0..).map(|row| dataset.source_row(row)))
+            .enumerate()
+        {
+            let Some((real, imaginary, measured)) = real
+                .zip(*imaginary)
+                .zip(*measured)
+                .map(|((real, imaginary), measured)| (real, imaginary, measured))
+            else {
+                continue;
+            };
+            let calculated = imaginary.atan2(real).to_degrees();
+            if (measured - calculated).abs() > options.tolerances.eis_phase_degrees {
+                diagnostics.push(contextual_diagnostic(
+                    dataset,
+                    options,
+                    Severity::Warning,
+                    DiagnosticCode::PhaseMismatch,
+                    "measured EIS phase differs from component-derived phase",
+                    source_row.or(Some(index + 1)),
+                    Some(&measured_name(dataset, crate::ColumnRole::ImpedancePhase)),
+                ));
+            }
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "scientific-validation")]
+fn measured_name(dataset: &Dataset, role: crate::ColumnRole) -> String {
+    dataset
+        .columns
+        .iter()
+        .find(|column| column.role == role)
+        .map(|column| column.canonical_name.clone())
+        .unwrap_or_default()
 }
 
 #[cfg(feature = "scientific-validation")]
@@ -209,18 +208,23 @@ fn run_time(dataset: &Dataset) -> Option<f64> {
 }
 
 #[cfg(feature = "scientific-validation")]
-fn diagnostic(
+fn contextual_diagnostic(
+    dataset: &Dataset,
+    options: &ReadOptions,
     severity: Severity,
     code: DiagnosticCode,
-    message: &str,
+    message: impl Into<String>,
     row: Option<usize>,
     column: Option<&str>,
 ) -> Diagnostic {
-    Diagnostic {
-        severity,
-        code,
-        message: message.into(),
-        row,
-        column: column.map(str::to_owned),
-    }
+    let mut result = Diagnostic::new(severity, code, message).with_context(
+        std::path::Path::new(&dataset.metadata.provenance.path),
+        dataset.metadata.provenance.worksheet.as_deref(),
+        &dataset.format,
+        options.effective_profile(),
+    );
+    result.row = row;
+    result.column = column.map(str::to_owned);
+    result.recovery = RecoveryAction::None;
+    result
 }

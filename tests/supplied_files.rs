@@ -1,5 +1,5 @@
 use electrodata_io::{
-    ColumnRole, DiagnosticCode, FormatId, ReadOptions, ValidationLevel, read, read_with_options,
+    ColumnRole, DiagnosticCode, FormatId, ReadOptions, ValidationLevel, read_with_options,
 };
 
 fn fixture(name: &str) -> std::path::PathBuf {
@@ -24,7 +24,7 @@ fn supplied_regular_file_is_preserved_as_present() {
     if !fixture("regular_file.csv").exists() {
         return;
     }
-    let dataset = read(fixture("regular_file.csv")).unwrap();
+    let dataset = electrodata_io::read_regular(fixture("regular_file.csv")).unwrap();
     assert_eq!(dataset.format, FormatId::RegularXy);
     // The checked-in fixture has one header plus 459,884 data rows; its final
     // physical line has no trailing newline.
@@ -42,7 +42,7 @@ fn supplied_ocpt_metadata_and_rows_are_preserved() {
     if !fixture("OCPT.csv").exists() {
         return;
     }
-    let options = ReadOptions::new().with_validation(ValidationLevel::Scientific);
+    let options = ReadOptions::compatibility().with_validation(ValidationLevel::Scientific);
     let dataset = read_with_options(fixture("OCPT.csv"), &options).unwrap();
     assert_eq!(dataset.format, FormatId::ChiOcpt);
     assert_eq!(dataset.data.shape(), (1_205, 2));
@@ -92,7 +92,7 @@ fn supplied_multichannel_duplicate_and_order_are_preserved() {
     if !fixture("Multichannel_OCPT.csv").exists() {
         return;
     }
-    let options = ReadOptions::new().with_validation(ValidationLevel::Scientific);
+    let options = ReadOptions::compatibility().with_validation(ValidationLevel::Scientific);
     let dataset = read_with_options(fixture("Multichannel_OCPT.csv"), &options).unwrap();
     assert_eq!(dataset.format, FormatId::ChiMultichannelOcpt);
     assert_eq!(dataset.data.shape(), (10_001, 3));

@@ -1,0 +1,1346 @@
+use electrodata_io::{
+    ColumnRole, DatasetKind, DiagnosticCode, Error, ErrorCategory, FormatId, InvalidCellPolicy,
+    InvalidTimePolicy, RaggedRowPolicy, ReadOptions, ReadProfile, RecoveryAction, SheetSelector,
+    TextEncoding, Unit, detect_format, read, read_with_options,
+};
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+const ALL_FIXTURES: &[&str] = &[
+    "regular_two_column.csv",
+    "regular_multichannel.csv",
+    "regular_headerless.csv",
+    "regular_missing_cells.csv",
+    "regular_malformed_timestamp.csv",
+    "regular_ragged_rows.csv",
+    "regular_invalid_numeric.csv",
+    "regular_duplicate_timestamps.csv",
+    "regular_nonmonotonic_timestamps.csv",
+    "generic_text.dat",
+    "chi_ocpt.csv",
+    "chi_multichannel_ocpt.csv",
+    "chi_eis_three_column.csv",
+    "chi_eis_four_column.csv",
+    "chi_eis_five_column.csv",
+    "chi_eis_reordered_columns.csv",
+    "timeseries.xlsx",
+];
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/rust_electroanalysis_cli")
+        .join(name)
+}
+
+fn compatibility() -> ReadOptions {
+    ReadOptions::new()
+        .with_invalid_time_policy(InvalidTimePolicy::SkipRow)
+        .with_invalid_cell_policy(InvalidCellPolicy::Null)
+        .with_ragged_row_policy(RaggedRowPolicy::PadNulls)
+        .with_coordinate_order_policy(electrodata_io::CoordinateOrderPolicy::Preserve)
+}
+
+#[test]
+fn manifest_drives_every_consumer_fixture() {
+    let manifest_text = std::fs::read_to_string(fixture("expected.toml")).unwrap();
+    let manifest: toml::Value = manifest_text.parse().unwrap();
+    assert_eq!(manifest["schema_version"].as_integer(), Some(1));
+    let cases = manifest["fixture"].as_array().unwrap();
+    let manifest_files: BTreeSet<_> = cases
+        .iter()
+        .map(|case| case["file"].as_str().unwrap())
+        .collect();
+    let required_files: BTreeSet<_> = ALL_FIXTURES.iter().copied().collect();
+    assert_eq!(manifest_files, required_files);
+
+    for case in cases {
+        let name = case["file"].as_str().unwrap();
+        let path = fixture(name);
+        assert!(path.is_file(), "missing contract fixture {name}");
+
+        let strict_expectation = case["strict_mode_result"].as_str().unwrap();
+        assert_strict_result(name, strict_expectation, read(&path));
+
+        let compatibility_expectation = case["compatibility_mode_result"].as_str().unwrap();
+        assert!(
+            compatibility_expectation.starts_with("accept"),
+            "unsupported compatibility expectation for {name}: {compatibility_expectation}"
+        );
+        let dataset = read_with_options(&path, &ReadOptions::compatibility()).unwrap();
+        assert_eq!(
+            kind_name(dataset.kind()),
+            case["dataset_kind"].as_str().unwrap(),
+            "{name}"
+        );
+        assert_eq!(
+            dataset.canonical_columns().first().unwrap().values.len(),
+            case["row_count"].as_integer().unwrap() as usize,
+            "{name} row_count"
+        );
+        assert_eq!(
+            dataset.canonical_columns().len(),
+            case["column_count"].as_integer().unwrap() as usize,
+            "{name} column_count"
+        );
+        assert_eq!(
+            dataset.missing_value_count(),
+            case["missing_value_count"].as_integer().unwrap() as usize,
+            "{name} missing_value_count"
+        );
+
+        let expected_columns = case["columns"].as_array().unwrap();
+        assert_eq!(
+            dataset.canonical_columns().len(),
+            expected_columns.len(),
+            "{name}"
+        );
+        for (position, (column, expected)) in dataset
+            .canonical_columns()
+            .iter()
+            .zip(expected_columns)
+            .enumerate()
+        {
+            let observed_name = column.original_name.as_deref().unwrap_or(&column.name);
+            assert_eq!(
+                observed_name,
+                expected["name"].as_str().unwrap(),
+                "{name} column {} name",
+                position + 1
+            );
+            assert_eq!(
+                role_name(&column.role),
+                expected["role"].as_str().unwrap(),
+                "{name} column {} role",
+                position + 1
+            );
+            assert_eq!(
+                unit_name(column.unit.as_ref()),
+                expected["unit"].as_str().unwrap(),
+                "{name} column {} unit",
+                position + 1
+            );
+        }
+
+        let expected_diagnostics = case["expected_diagnostics"].as_array().unwrap();
+        assert_eq!(
+            dataset.diagnostics.len(),
+            expected_diagnostics.len(),
+            "{name} diagnostic count: {:#?}",
+            dataset.diagnostics
+        );
+        for (diagnostic, expected) in dataset.diagnostics.iter().zip(expected_diagnostics) {
+            assert_eq!(
+                diagnostic_code_name(diagnostic.code),
+                expected["code"].as_str().unwrap(),
+                "{name}"
+            );
+            assert_eq!(
+                severity_name(diagnostic.severity),
+                expected["severity"].as_str().unwrap(),
+                "{name}"
+            );
+            assert_eq!(
+                diagnostic.row,
+                Some(expected["row"].as_integer().unwrap() as usize),
+                "{name}"
+            );
+            let expected_column = expected["column"].as_str().unwrap();
+            assert_eq!(
+                diagnostic.column.as_deref().unwrap_or("*"),
+                expected_column,
+                "{name}"
+            );
+            let expected_column_index = if expected_column == "*" {
+                None
+            } else if let Some(index) = expected_columns
+                .iter()
+                .position(|column| column["name"].as_str() == Some(expected_column))
+            {
+                Some(index + 1)
+            } else {
+                expected_column
+                    .strip_prefix("column_")
+                    .and_then(|index| index.parse().ok())
+            };
+            assert_eq!(diagnostic.column_index, expected_column_index, "{name}");
+            assert_eq!(
+                recovery_name(diagnostic.recovery),
+                expected["action"].as_str().unwrap(),
+                "{name}"
+            );
+            assert_eq!(
+                diagnostic.path.as_deref(),
+                Some(path.to_str().unwrap()),
+                "{name}"
+            );
+            assert_eq!(
+                diagnostic.format_candidate.as_ref(),
+                Some(&dataset.format),
+                "{name}"
+            );
+            assert_eq!(diagnostic.profile, ReadProfile::Compatibility, "{name}");
+        }
+    }
+}
+
+fn assert_strict_result(
+    name: &str,
+    expectation: &str,
+    result: electrodata_io::Result<electrodata_io::Dataset>,
+) {
+    if expectation.starts_with("accept") {
+        result.unwrap_or_else(|error| panic!("{name} should be accepted in strict mode: {error}"));
+        return;
+    }
+    let error = result.expect_err(&format!("{name} should be rejected in strict mode"));
+    let matches = if expectation.contains("AmbiguousHeaderlessSchema") {
+        matches!(&error, Error::AmbiguousHeaderlessSchema { .. })
+    } else if expectation.contains("MalformedNumeric") {
+        matches!(&error, Error::MalformedNumeric { .. })
+    } else if expectation.contains("RaggedRow") {
+        matches!(&error, Error::RaggedRow { .. })
+    } else if expectation.contains("DuplicateTimestamp") {
+        matches!(&error, Error::DuplicateCoordinate { .. })
+    } else if expectation.contains("NonMonotonicTimestamp") {
+        matches!(&error, Error::NonMonotonicCoordinate { .. })
+    } else {
+        false
+    };
+    assert!(matches, "{name}: {expectation}; observed {error:?}");
+}
+
+fn kind_name(kind: DatasetKind) -> &'static str {
+    match kind {
+        DatasetKind::TimeSeries => "TimeSeries",
+        DatasetKind::ImpedanceSpectrum => "ImpedanceSpectrum",
+        DatasetKind::GenericTable => "GenericTable",
+    }
+}
+
+fn role_name(role: &ColumnRole) -> String {
+    match role {
+        ColumnRole::Time => "Time".into(),
+        ColumnRole::Frequency => "Frequency".into(),
+        ColumnRole::ImpedanceReal => "ImpedanceReal".into(),
+        ColumnRole::ImpedanceImaginary => "ImpedanceImaginary".into(),
+        ColumnRole::ImpedanceMagnitude => "ImpedanceMagnitude".into(),
+        ColumnRole::ImpedancePhase | ColumnRole::Phase => "ImpedancePhase".into(),
+        ColumnRole::Potential => "Potential".into(),
+        ColumnRole::Current => "Current".into(),
+        ColumnRole::MeasurementChannel(channel) | ColumnRole::PotentialChannel(channel) => {
+            format!("MeasurementChannel({channel})")
+        }
+        ColumnRole::Unknown => "Unknown".into(),
+        ColumnRole::X => "X".into(),
+        ColumnRole::Y => "Y".into(),
+        ColumnRole::Custom(value) => format!("Custom({value})"),
+        _ => "NonExhaustiveRole".into(),
+    }
+}
+
+fn unit_name(unit: Option<&Unit>) -> String {
+    match unit {
+        Some(Unit::Unknown) | None => "Unknown".into(),
+        Some(Unit::Second) => "s".into(),
+        Some(Unit::Hour) => "h".into(),
+        Some(Unit::Day) => "d".into(),
+        Some(Unit::Hertz) => "Hz".into(),
+        Some(Unit::Ohm) => "ohm".into(),
+        Some(Unit::Degree) => "deg".into(),
+        Some(Unit::Volt) => "V".into(),
+        Some(Unit::Millivolt) => "mV".into(),
+        Some(Unit::Ampere) => "A".into(),
+        Some(Unit::Milliampere) => "mA".into(),
+        Some(Unit::Microampere) => "uA".into(),
+        Some(Unit::Other(value)) => value.clone(),
+    }
+}
+
+fn diagnostic_code_name(code: DiagnosticCode) -> &'static str {
+    match code {
+        DiagnosticCode::LossyDecoding => "LossyDecoding",
+        DiagnosticCode::MissingValue => "MissingValue",
+        DiagnosticCode::MalformedTimestamp => "MalformedTimestamp",
+        DiagnosticCode::MalformedNumeric => "MalformedNumeric",
+        DiagnosticCode::RaggedRow => "RaggedRow",
+        DiagnosticCode::RowSkipped => "RowSkipped",
+        DiagnosticCode::ValueReplacedWithMissing => "ValueReplacedWithMissing",
+        DiagnosticCode::RowPadded => "RowPadded",
+        DiagnosticCode::ExtraCellsIgnored => "ExtraCellsIgnored",
+        DiagnosticCode::HeaderlessRoleInference => "HeaderlessRoleInference",
+        DiagnosticCode::RowClassification => "RowClassification",
+        DiagnosticCode::UnknownUnit => "UnknownUnit",
+        DiagnosticCode::DuplicateTimestamp | DiagnosticCode::DuplicateTime => "DuplicateTimestamp",
+        DiagnosticCode::NonMonotonicTimestamp | DiagnosticCode::NonMonotonicTime => {
+            "NonMonotonicTimestamp"
+        }
+        DiagnosticCode::DurationMismatch => "DurationMismatch",
+        DiagnosticCode::NonMonotonicFrequency => "NonMonotonicFrequency",
+        DiagnosticCode::NonPositiveFrequency => "NonPositiveFrequency",
+        DiagnosticCode::MagnitudeMismatch => "MagnitudeMismatch",
+        DiagnosticCode::PhaseMismatch => "PhaseMismatch",
+        DiagnosticCode::UnusableFormula => "UnusableFormula",
+        DiagnosticCode::EisSchema => "EisSchema",
+    }
+}
+
+fn severity_name(severity: electrodata_io::Severity) -> &'static str {
+    match severity {
+        electrodata_io::Severity::Info => "info",
+        electrodata_io::Severity::Warning => "warning",
+        electrodata_io::Severity::Error => "error",
+    }
+}
+
+fn recovery_name(recovery: RecoveryAction) -> &'static str {
+    match recovery {
+        RecoveryAction::None => "None",
+        RecoveryAction::RowSkipped => "RowSkipped",
+        RecoveryAction::ValueReplacedWithMissing => "ValueReplacedWithMissing",
+        RecoveryAction::RowPadded => "RowPadded",
+        RecoveryAction::ExtraCellsIgnored => "ExtraCellsIgnored",
+        RecoveryAction::Preserved => "Preserved",
+        RecoveryAction::RolesInferred => "RolesInferred",
+        RecoveryAction::LossyDecoded => "LossyDecoded",
+        RecoveryAction::HeaderInterpreted => "HeaderInterpreted",
+        RecoveryAction::MetadataPreserved => "MetadataPreserved",
+        RecoveryAction::EmptyRowIgnored => "EmptyRowIgnored",
+    }
+}
+
+#[test]
+fn canonical_two_column_and_multichannel_models() {
+    let two = read(fixture("regular_two_column.csv")).unwrap();
+    assert_eq!(two.kind(), DatasetKind::TimeSeries);
+    assert_eq!(two.schema.columns.len(), 2);
+    assert_eq!(two.canonical_columns()[0].role, ColumnRole::Time);
+    assert_eq!(two.canonical_columns()[0].unit, Some(Unit::Second));
+    assert_eq!(two.canonical_columns()[1].role, ColumnRole::Potential);
+    assert_eq!(two.canonical_columns()[1].unit, Some(Unit::Volt));
+    assert_eq!(two.f64_values(&ColumnRole::Time).unwrap().len(), 3);
+
+    let wide = read(fixture("regular_multichannel.csv")).unwrap();
+    assert_eq!(wide.kind(), DatasetKind::TimeSeries);
+    assert_eq!(wide.canonical_columns().len(), 5);
+    assert_eq!(
+        wide.canonical_columns()[1].role,
+        ColumnRole::MeasurementChannel(1)
+    );
+    assert_eq!(
+        wide.canonical_columns()[2].role,
+        ColumnRole::MeasurementChannel(5)
+    );
+    assert_eq!(wide.canonical_columns()[3].role, ColumnRole::Current);
+    assert_eq!(wide.canonical_columns()[3].unit, Some(Unit::Ampere));
+    assert_eq!(wide.canonical_columns()[4].role, ColumnRole::Unknown);
+    assert_eq!(
+        wide.canonical_columns()[4].unit,
+        Some(Unit::Other("C".into()))
+    );
+    assert_eq!(wide.measurement_channels().len(), 4);
+}
+
+#[test]
+fn headerless_tables_require_explicit_compatibility_and_retain_all_rows() {
+    let path = fixture("regular_headerless.csv");
+    assert!(matches!(
+        read(&path),
+        Err(Error::AmbiguousHeaderlessSchema { .. })
+    ));
+    let dataset = read_with_options(&path, &compatibility()).unwrap();
+    assert_eq!(dataset.kind(), DatasetKind::TimeSeries);
+    assert_eq!(dataset.source_row(0), Some(1));
+    assert_eq!(dataset.canonical_columns()[0].name, "column_1");
+    assert_eq!(dataset.canonical_columns()[1].name, "column_2");
+    assert_eq!(dataset.canonical_columns()[1].role, ColumnRole::Unknown);
+    assert_eq!(dataset.canonical_columns()[0].unit, Some(Unit::Unknown));
+    assert!(dataset.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == DiagnosticCode::HeaderlessRoleInference
+            && diagnostic.recovery == RecoveryAction::RolesInferred
+    }));
+
+    let wide = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(wide.path(), "0,1,2,3\n1,4,,6\n2,7,8,9\n").unwrap();
+    let dataset = read_with_options(wide.path(), &compatibility()).unwrap();
+    assert_eq!(dataset.canonical_columns().len(), 4);
+    assert_eq!(dataset.source_row(0), Some(1));
+    assert_eq!(
+        dataset.coordinate_values().unwrap(),
+        [Some(0.0), Some(1.0), Some(2.0)]
+    );
+    assert_eq!(dataset.coordinate_unit().unwrap(), Some(&Unit::Unknown));
+    assert!(matches!(
+        dataset.time_seconds(),
+        Err(Error::UnknownUnit {
+            role: ColumnRole::Time,
+            ..
+        })
+    ));
+    assert_eq!(
+        dataset.time_series_view().unwrap().coordinate_values(),
+        [Some(0.0), Some(1.0), Some(2.0)]
+    );
+    assert_eq!(dataset.canonical_columns()[2].values[1], None);
+    assert_eq!(dataset.measurement_channels().len(), 3);
+}
+
+#[test]
+fn arbitrary_channel_names_units_and_nulls_are_retained() {
+    let file = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        file.path(),
+        "Time/s,CH12/mV,Optical/counts\n0,5,100\n1,,101\n2,7,102\n",
+    )
+    .unwrap();
+    let dataset = read(file.path()).unwrap();
+    assert_eq!(
+        dataset.canonical_columns()[1].role,
+        ColumnRole::MeasurementChannel(12)
+    );
+    assert_eq!(dataset.canonical_columns()[1].unit, Some(Unit::Millivolt));
+    assert_eq!(
+        dataset.canonical_columns()[2].unit,
+        Some(Unit::Other("counts".into()))
+    );
+    assert_eq!(dataset.canonical_columns()[1].values[1], None);
+}
+
+#[test]
+fn missing_cells_are_preserved_in_strict_mode_with_locations() {
+    let dataset = read(fixture("regular_missing_cells.csv")).unwrap();
+    assert_eq!(dataset.missing_value_count(), 2);
+    assert_eq!(dataset.f64_values(&ColumnRole::Potential).unwrap()[1], None);
+    assert_eq!(dataset.f64_values(&ColumnRole::Current).unwrap()[2], None);
+    let locations: Vec<_> = dataset
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == DiagnosticCode::MissingValue)
+        .map(|diagnostic| (diagnostic.row, diagnostic.column_index))
+        .collect();
+    assert_eq!(locations, vec![(Some(3), Some(2)), (Some(4), Some(3))]);
+}
+
+#[test]
+fn malformed_coordinates_are_structured_errors_or_diagnosed_skips() {
+    let path = fixture("regular_malformed_timestamp.csv");
+    let error = read(&path).unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::MalformedNumeric);
+    assert_eq!(error.path(), Some(path.as_path()));
+    assert_eq!(error.format_candidate(), Some(&FormatId::RegularXy));
+    assert_eq!(error.row(), Some(3));
+    assert_eq!(error.column(), Some(1));
+    assert!(error.source_error().is_some());
+    let context = error.context();
+    assert_eq!(context.category, ErrorCategory::MalformedNumeric);
+    assert_eq!(context.row, Some(3));
+
+    let dataset = read_with_options(&path, &compatibility()).unwrap();
+    assert_eq!(
+        dataset.f64_values(&ColumnRole::Time).unwrap(),
+        [Some(0.0), Some(2.0)]
+    );
+    assert_eq!(dataset.source_row(0), Some(2));
+    assert_eq!(dataset.source_row(1), Some(4));
+    assert!(dataset.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == DiagnosticCode::MalformedTimestamp
+            && diagnostic.row == Some(3)
+            && diagnostic.column_index == Some(1)
+            && diagnostic.recovery == RecoveryAction::RowSkipped
+    }));
+    assert!(
+        dataset
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == DiagnosticCode::RowSkipped)
+    );
+}
+
+#[test]
+fn malformed_measurements_are_errors_or_null_recoveries() {
+    let path = fixture("regular_invalid_numeric.csv");
+    assert!(matches!(
+        read(&path),
+        Err(Error::MalformedNumeric {
+            row: 3,
+            column: 2,
+            ..
+        })
+    ));
+    let dataset = read_with_options(&path, &compatibility()).unwrap();
+    assert_eq!(dataset.f64_values(&ColumnRole::Potential).unwrap()[1], None);
+    assert!(dataset.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == DiagnosticCode::ValueReplacedWithMissing
+            && diagnostic.row == Some(3)
+            && diagnostic.recovery == RecoveryAction::ValueReplacedWithMissing
+    }));
+}
+
+#[test]
+fn ragged_rows_are_errors_or_diagnosed_padding_and_truncation() {
+    let path = fixture("regular_ragged_rows.csv");
+    assert!(matches!(read(&path), Err(Error::RaggedRow { row: 3, .. })));
+    let dataset = read_with_options(&path, &compatibility()).unwrap();
+    assert_eq!(dataset.canonical_columns().len(), 3);
+    assert_eq!(dataset.canonical_columns()[2].values[1], None);
+    for expected in [
+        DiagnosticCode::RaggedRow,
+        DiagnosticCode::RowPadded,
+        DiagnosticCode::ExtraCellsIgnored,
+    ] {
+        assert!(
+            dataset
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == expected),
+            "missing {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn strict_and_compatibility_coordinate_order_are_explicit() {
+    let duplicate = fixture("regular_duplicate_timestamps.csv");
+    assert!(matches!(
+        read(&duplicate),
+        Err(Error::DuplicateCoordinate { row: 4, .. })
+    ));
+    let dataset = read_with_options(&duplicate, &compatibility()).unwrap();
+    assert_eq!(dataset.source_row(2), Some(4));
+    assert!(
+        dataset
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == DiagnosticCode::DuplicateTimestamp)
+    );
+
+    let nonmonotonic = fixture("regular_nonmonotonic_timestamps.csv");
+    assert!(matches!(
+        read(&nonmonotonic),
+        Err(Error::NonMonotonicCoordinate { row: 4, .. })
+    ));
+    let dataset = read_with_options(&nonmonotonic, &compatibility()).unwrap();
+    assert_eq!(
+        dataset.f64_values(&ColumnRole::Time).unwrap(),
+        [Some(0.0), Some(1.0), Some(0.5), Some(2.0)]
+    );
+}
+
+#[test]
+fn dat_text_chi_time_series_and_xlsx_share_the_canonical_pipeline() {
+    let dat = read(fixture("generic_text.dat")).unwrap();
+    assert_eq!(dat.kind(), DatasetKind::TimeSeries);
+    assert_eq!(dat.canonical_columns().len(), 3);
+    assert_eq!(
+        dat.metadata.provenance.container,
+        electrodata_io::ContainerFormat::Csv
+    );
+
+    let ocpt = read(fixture("chi_ocpt.csv")).unwrap();
+    assert_eq!(ocpt.kind(), DatasetKind::TimeSeries);
+    let multi = read(fixture("chi_multichannel_ocpt.csv")).unwrap();
+    assert_eq!(multi.measurement_channels().len(), 2);
+
+    let xlsx = read(fixture("timeseries.xlsx")).unwrap();
+    assert_eq!(xlsx.kind(), DatasetKind::TimeSeries);
+    assert_eq!(
+        xlsx.metadata.provenance.worksheet.as_deref(),
+        Some("measurement")
+    );
+    assert_eq!(xlsx.canonical_columns().len(), 3);
+    assert_eq!(
+        xlsx.canonical_columns()[1].role,
+        ColumnRole::MeasurementChannel(1)
+    );
+}
+
+#[test]
+fn eis_detection_is_role_based_for_three_four_five_and_reordered_columns() {
+    let cases = [
+        ("chi_eis_three_column.csv", 3),
+        ("chi_eis_four_column.csv", 4),
+        ("chi_eis_five_column.csv", 5),
+        ("chi_eis_reordered_columns.csv", 5),
+    ];
+    for (name, width) in cases {
+        let dataset = read(fixture(name)).unwrap();
+        assert_eq!(dataset.kind(), DatasetKind::ImpedanceSpectrum, "{name}");
+        assert_eq!(dataset.canonical_columns().len(), width, "{name}");
+        assert_eq!(
+            dataset.f64_values(&ColumnRole::Frequency).unwrap()[0],
+            Some(1000.0)
+        );
+        assert_eq!(
+            dataset.f64_values(&ColumnRole::ImpedanceReal).unwrap()[0],
+            Some(10.0)
+        );
+        assert_eq!(
+            dataset.f64_values(&ColumnRole::ImpedanceImaginary).unwrap()[0],
+            Some(-1.0)
+        );
+    }
+}
+
+#[test]
+fn eis_typed_view_derives_only_absent_optional_fields() {
+    let three = read(fixture("chi_eis_three_column.csv")).unwrap();
+    let view = three.eis_view().unwrap();
+    assert!(view.measured_magnitude.is_none());
+    assert!(view.measured_phase.is_none());
+    assert!((view.magnitude_values()[0].unwrap() - 10.049_875_621).abs() < 1e-8);
+    assert!((view.phase_values()[0].unwrap() + 5.710_593_137).abs() < 1e-8);
+    assert_eq!(three.canonical_columns().len(), 3);
+
+    let four = read(fixture("chi_eis_four_column.csv")).unwrap();
+    let view = four.eis_view().unwrap();
+    assert!(view.measured_magnitude.is_none());
+    assert_eq!(view.phase_values()[0], Some(-5.710_593));
+
+    let five = read(fixture("chi_eis_five_column.csv")).unwrap();
+    let view = five.eis_view().unwrap();
+    assert_eq!(view.magnitude_values()[0], Some(10.049_876));
+    assert_eq!(view.phase_values()[0], Some(-5.710_593));
+}
+
+#[test]
+fn header_only_eis_is_detected_with_lower_confidence() {
+    let file = tempfile::Builder::new().suffix(".dat").tempfile().unwrap();
+    std::fs::write(
+        file.path(),
+        "Z\"/ohm,Freq/Hz,Z'/ohm\n-1,1000,10\n-5,100,15\n-10,10,20\n",
+    )
+    .unwrap();
+    let header_only = detect_format(file.path()).unwrap();
+    let preamble = detect_format(fixture("chi_eis_three_column.csv")).unwrap();
+    assert_eq!(
+        header_only.format,
+        electrodata_io::ElectroDataFormat::ChiEis
+    );
+    assert!(header_only.confidence < preamble.confidence);
+    assert_eq!(
+        read(file.path()).unwrap().kind(),
+        DatasetKind::ImpedanceSpectrum
+    );
+}
+
+#[test]
+fn binary_content_is_rejected_even_with_a_text_extension() {
+    let file = tempfile::Builder::new().suffix(".dat").tempfile().unwrap();
+    std::fs::write(file.path(), [0_u8, 159, 146, 150, 0, 1]).unwrap();
+    let error = read(file.path()).unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::UnsupportedBinary);
+    assert!(matches!(error, Error::UnsupportedBinary { .. }));
+}
+
+#[test]
+fn typed_time_access_is_unit_checked_and_converted() {
+    let hours = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(hours.path(), "Time/h,Potential/V\n0,1\n0.5,2\n1,3\n").unwrap();
+    let dataset = read(hours.path()).unwrap();
+    assert_eq!(
+        dataset.time_seconds().unwrap(),
+        [Some(0.0), Some(1_800.0), Some(3_600.0)]
+    );
+    let view = dataset.time_series_view().unwrap();
+    let conversion = view.time_conversion.as_ref().unwrap();
+    assert_eq!(conversion.source_unit, Unit::Hour);
+    assert_eq!(conversion.target_unit, Unit::Second);
+    assert_eq!(conversion.scale, 3_600.0);
+    assert_eq!(
+        view.normalized_seconds().unwrap(),
+        [Some(0.0), Some(1_800.0), Some(3_600.0)]
+    );
+
+    let headerless = read_with_options(
+        fixture("regular_headerless.csv"),
+        &ReadOptions::compatibility(),
+    )
+    .unwrap();
+    let view = headerless.time_series_view().unwrap();
+    assert_eq!(view.coordinate_values(), [Some(0.0), Some(1.0), Some(2.0)]);
+    assert_eq!(view.coordinate_unit(), Some(&Unit::Unknown));
+    assert!(view.normalized_seconds().is_none());
+    assert!(matches!(
+        headerless.time_seconds(),
+        Err(Error::UnknownUnit {
+            role: ColumnRole::Time,
+            ..
+        })
+    ));
+
+    let incompatible = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(incompatible.path(), "Time/V,Potential/V\n0,1\n1,2\n2,3\n").unwrap();
+    let dataset = read(incompatible.path()).unwrap();
+    assert!(
+        dataset
+            .time_series_view()
+            .unwrap()
+            .normalized_seconds()
+            .is_none()
+    );
+    assert!(matches!(
+        dataset.time_seconds(),
+        Err(Error::IncompatibleUnit {
+            role: ColumnRole::Time,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn eis_view_rejects_missing_required_values_and_units() {
+    let missing = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        missing.path(),
+        "Freq/Hz,Z'/ohm,Z\"/ohm\n1000,10,-1\n100,15,\n10,20,-10\n",
+    )
+    .unwrap();
+    let dataset = read(missing.path()).unwrap();
+    let error = dataset.eis_view().unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::MissingValue);
+    assert_eq!(error.row(), Some(3));
+    assert_eq!(error.column(), Some(3));
+
+    let wrong_unit = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        wrong_unit.path(),
+        "Freq/Hz,Z'/V,Z\"/ohm\n1000,10,-1\n100,15,-5\n10,20,-10\n",
+    )
+    .unwrap();
+    let dataset = read(wrong_unit.path()).unwrap();
+    match dataset.eis_view().unwrap_err() {
+        Error::IncompatibleUnit {
+            path,
+            role,
+            source_unit,
+            target_unit,
+            column,
+            details,
+        } => {
+            assert_eq!(path, wrong_unit.path());
+            assert_eq!(role, ColumnRole::ImpedanceReal);
+            assert_eq!(source_unit, Unit::Volt);
+            assert_eq!(target_unit, Unit::Ohm);
+            assert_eq!(column, Some(2));
+            assert_eq!(details.source_header.as_deref(), Some("Z'/V"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    let wrong_frequency_unit = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        wrong_frequency_unit.path(),
+        "Freq/V,Z'/ohm,Z\"/ohm\n1000,10,-1\n100,15,-5\n10,20,-10\n",
+    )
+    .unwrap();
+    let dataset = read(wrong_frequency_unit.path()).unwrap();
+    assert!(matches!(
+        dataset.eis_view(),
+        Err(Error::IncompatibleUnit {
+            role: ColumnRole::Frequency,
+            source_unit: Unit::Volt,
+            target_unit: Unit::Hertz,
+            column: Some(1),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn eis_view_rejects_non_eis_datasets_with_view_context() {
+    let path = fixture("regular_two_column.csv");
+    let dataset = read(&path).unwrap();
+
+    match dataset.eis_view().unwrap_err() {
+        Error::InvalidDatasetView {
+            path: error_path,
+            requested_view,
+            dataset_kind,
+        } => {
+            assert_eq!(error_path, path);
+            assert_eq!(requested_view, "EisView");
+            assert_eq!(dataset_kind, DatasetKind::TimeSeries);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn strict_eis_data_errors_retain_parser_context() {
+    let malformed = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        malformed.path(),
+        "Freq/Hz,Z'/ohm,Z\"/ohm\n1000,10,-1\n100,not-a-number,-5\n10,20,-10\n",
+    )
+    .unwrap();
+    match read(malformed.path()).unwrap_err() {
+        Error::MalformedNumeric {
+            path,
+            format_candidate,
+            row,
+            column,
+            value,
+            source,
+            ..
+        } => {
+            assert_eq!(path, malformed.path());
+            assert_eq!(format_candidate, Some(FormatId::ChiEis));
+            assert_eq!((row, column, value.as_str()), (3, 2, "not-a-number"));
+            assert!(source.is_some());
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    let ragged = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        ragged.path(),
+        "Freq/Hz,Z'/ohm,Z\"/ohm\n1000,10,-1\n100,15\n10,20,-10\n",
+    )
+    .unwrap();
+    match read(ragged.path()).unwrap_err() {
+        Error::RaggedRow {
+            path,
+            format_candidate,
+            row,
+            expected,
+            actual,
+            ..
+        } => {
+            assert_eq!(path, ragged.path());
+            assert_eq!(format_candidate, Some(FormatId::ChiEis));
+            assert_eq!((row, expected, actual), (3, 3, 2));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn summary_reports_malformed_rows_and_per_column_missing_counts() {
+    let dataset = read_with_options(
+        fixture("regular_invalid_numeric.csv"),
+        &ReadOptions::compatibility(),
+    )
+    .unwrap();
+    let summary = dataset.diagnostic_summary();
+    assert_eq!(summary.malformed_cells, 1);
+    assert_eq!(summary.malformed_rows, 1);
+    assert_eq!(summary.missing_cells, 1);
+    assert_eq!(summary.missing_by_column.len(), 2);
+    assert_eq!(summary.missing_by_column[0].missing_cells, 0);
+    assert_eq!(summary.missing_by_column[1].name, "potential_v");
+    assert_eq!(summary.missing_by_column[1].missing_cells, 1);
+}
+
+#[test]
+fn provenance_retains_detection_policy_columns_and_digest() {
+    let dataset = read(fixture("generic_text.dat")).unwrap();
+    let provenance = &dataset.metadata.provenance;
+    assert_eq!(provenance.delimiter, Some('\t'));
+    assert_eq!(provenance.encoding, Some(TextEncoding::Utf8));
+    assert_eq!(provenance.detected_format, FormatId::RegularXy);
+    assert!(provenance.detection_confidence >= 0.9);
+    assert!(!provenance.detection_evidence.is_empty());
+    assert_eq!(provenance.read_options.profile, ReadProfile::Strict);
+    assert_eq!(provenance.source_columns.len(), 3);
+    assert_eq!(provenance.source_columns[2].position, 3);
+    assert_eq!(provenance.source_columns[2].source_name, "Current/A");
+    assert_eq!(provenance.source_sha256.len(), 64);
+    assert!(
+        provenance
+            .source_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    );
+}
+
+#[test]
+fn xlsx_unusable_formula_is_typed_or_diagnosed() {
+    use rust_xlsxwriter::{Formula, Workbook};
+
+    let file = tempfile::Builder::new().suffix(".xlsx").tempfile().unwrap();
+    let mut workbook = Workbook::new();
+    let worksheet = workbook.add_worksheet();
+    worksheet.set_name("measurement").unwrap();
+    worksheet.write_string(0, 0, "Time/s").unwrap();
+    worksheet.write_string(0, 1, "Potential/V").unwrap();
+    worksheet.write_number(1, 0, 0.0).unwrap();
+    worksheet
+        .write_formula(1, 1, Formula::new("=1+1").set_result("not-a-number"))
+        .unwrap();
+    worksheet.write_number(2, 0, 1.0).unwrap();
+    worksheet.write_number(2, 1, 2.0).unwrap();
+    worksheet.write_number(3, 0, 2.0).unwrap();
+    worksheet.write_number(3, 1, 3.0).unwrap();
+    workbook.save(file.path()).unwrap();
+
+    let strict = read(file.path()).unwrap_err();
+    assert_eq!(strict.category(), ErrorCategory::Formula);
+    assert_eq!(strict.path(), Some(file.path()));
+    assert_eq!(strict.worksheet(), Some("measurement"));
+    assert_eq!(strict.row(), Some(2));
+    assert_eq!(strict.column(), Some(2));
+
+    let dataset = read_with_options(file.path(), &ReadOptions::compatibility()).unwrap();
+    assert_eq!(dataset.f64_values(&ColumnRole::Potential).unwrap()[0], None);
+    let diagnostic = dataset
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == DiagnosticCode::UnusableFormula)
+        .unwrap();
+    assert_eq!(diagnostic.row, Some(2));
+    assert_eq!(diagnostic.column_index, Some(2));
+    assert_eq!(
+        diagnostic.recovery,
+        RecoveryAction::ValueReplacedWithMissing
+    );
+    assert_eq!(dataset.metadata.provenance.formulas.len(), 1);
+    assert_eq!(
+        dataset.metadata.provenance.formulas[0].cache_status,
+        electrodata_io::FormulaCacheStatus::Unusable
+    );
+}
+
+#[test]
+fn worksheet_and_detection_errors_retain_context() {
+    use rust_xlsxwriter::Workbook;
+
+    let path = fixture("timeseries.xlsx");
+    let error = read_with_options(
+        &path,
+        &ReadOptions::new().with_sheet(SheetSelector::Name("absent".into())),
+    )
+    .unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::Worksheet);
+    assert_eq!(error.path(), Some(path.as_path()));
+    assert_eq!(error.worksheet(), Some("absent"));
+    assert_eq!(error.context().worksheet, Some("absent"));
+
+    let unknown = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(unknown.path(), "not a scientific table\n").unwrap();
+    let error = read(unknown.path()).unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::Detection);
+    assert_eq!(error.path(), Some(unknown.path()));
+
+    let ambiguous = tempfile::Builder::new().suffix(".xlsx").tempfile().unwrap();
+    let mut workbook = Workbook::new();
+    for name in ["first", "second"] {
+        let worksheet = workbook.add_worksheet();
+        worksheet.set_name(name).unwrap();
+        worksheet.write_string(0, 0, "Time/s").unwrap();
+        worksheet.write_string(0, 1, "Potential/V").unwrap();
+        for row in 1..=3 {
+            worksheet.write_number(row, 0, (row - 1) as f64).unwrap();
+            worksheet.write_number(row, 1, row as f64).unwrap();
+        }
+    }
+    workbook.save(ambiguous.path()).unwrap();
+    let error = detect_format(ambiguous.path()).unwrap_err();
+    assert_eq!(error.path(), Some(ambiguous.path()));
+    let Error::AmbiguousWorksheet { candidates, .. } = error else {
+        panic!("expected worksheet ambiguity");
+    };
+    let worksheets: BTreeSet<_> = candidates
+        .iter()
+        .map(|candidate| candidate.name.as_str())
+        .collect();
+    assert_eq!(worksheets, BTreeSet::from(["first", "second"]));
+}
+
+#[test]
+fn eis_missing_required_role_is_structured() {
+    let file = tempfile::Builder::new().suffix(".dat").tempfile().unwrap();
+    std::fs::write(
+        file.path(),
+        "Freq/Hz,Z'/ohm,Z/ohm\n1000,10,10.05\n100,15,15.81\n10,20,22.36\n",
+    )
+    .unwrap();
+    let error = read(file.path()).unwrap_err();
+    assert!(matches!(
+        error,
+        Error::MissingRequiredRole {
+            role: ColumnRole::ImpedanceImaginary,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn eis_missing_frequency_reaches_required_role_validation() {
+    let file = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        file.path(),
+        "Z'/ohm,Z\"/ohm,Z/ohm\n10,-1,10.05\n15,-5,15.81\n20,-10,22.36\n",
+    )
+    .unwrap();
+
+    assert!(matches!(
+        read(file.path()),
+        Err(Error::MissingRequiredRole {
+            role: ColumnRole::Frequency,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn explicit_incomplete_eis_reaches_structured_required_role_validation() {
+    let file = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        file.path(),
+        "A.C. Impedance\n\nFreq/Hz,Z/ohm,Phase/deg\n1000,10.05,-5\n100,15.81,-18\n10,22.36,-27\n",
+    )
+    .unwrap();
+
+    let error = read(file.path()).unwrap_err();
+    match error {
+        Error::MissingRequiredRole {
+            path,
+            format_candidate,
+            role,
+            detected_roles,
+            diagnostics,
+        } => {
+            assert_eq!(path, file.path());
+            assert_eq!(format_candidate, FormatId::ChiEis);
+            assert_eq!(role, ColumnRole::ImpedanceReal);
+            assert_eq!(
+                detected_roles,
+                [
+                    ColumnRole::Frequency,
+                    ColumnRole::ImpedanceMagnitude,
+                    ColumnRole::ImpedancePhase,
+                ]
+            );
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(
+                diagnostics[0].source_headers,
+                ["Freq/Hz", "Z/ohm", "Phase/deg"]
+            );
+            assert_eq!(diagnostics[0].code, DiagnosticCode::EisSchema);
+            assert_eq!(diagnostics[0].row, Some(3));
+            assert_eq!(diagnostics[0].format_candidate, Some(FormatId::ChiEis));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn eis_missing_real_and_duplicate_frequency_are_structured_schema_errors() {
+    let missing_real = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        missing_real.path(),
+        "Freq/Hz,Z\"/ohm,Z/ohm\n1000,-1,10.05\n100,-5,15.81\n10,-10,22.36\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        read(missing_real.path()),
+        Err(Error::MissingRequiredRole {
+            role: ColumnRole::ImpedanceReal,
+            ..
+        })
+    ));
+
+    let duplicate_frequency = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        duplicate_frequency.path(),
+        "Freq/Hz,Frequency/Hz,Z'/ohm\n1000,1000,10\n100,100,15\n10,10,20\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        read(duplicate_frequency.path()),
+        Err(Error::EisSchemaConflict { details })
+            if details.conflicting_role == Some(ColumnRole::Frequency) && details.column == 2
+    ));
+}
+
+#[test]
+fn eis_duplicate_and_ambiguous_headers_have_schema_diagnostics() {
+    let duplicate = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        duplicate.path(),
+        "Freq/Hz,Z'/ohm,Z'/ohm\n1000,10,11\n100,15,16\n10,20,21\n",
+    )
+    .unwrap();
+    let error = read(duplicate.path()).unwrap_err();
+    let Error::EisSchemaConflict { details } = error else {
+        panic!("expected an EIS schema conflict");
+    };
+    let details = *details;
+    let electrodata_io::EisSchemaError {
+        row,
+        column,
+        header,
+        candidate_roles,
+        conflicting_role,
+        diagnostics,
+        ..
+    } = details;
+    assert_eq!((row, column, header.as_str()), (1, 3, "Z'/ohm"));
+    assert_eq!(candidate_roles, [ColumnRole::ImpedanceReal]);
+    assert_eq!(conflicting_role, Some(ColumnRole::ImpedanceReal));
+    assert_eq!(diagnostics[0].candidate_roles, candidate_roles);
+    assert_eq!(
+        diagnostics[0].resolution.as_deref(),
+        Some("rejected: duplicate EIS role")
+    );
+
+    let ambiguous = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        ambiguous.path(),
+        "Freq/Hz,\"Z' + Z\"\"\",Z/ohm\n1000,10,10.05\n100,15,15.81\n10,20,22.36\n",
+    )
+    .unwrap();
+    let error = read(ambiguous.path()).unwrap_err();
+    let Error::EisSchemaConflict { details } = error else {
+        panic!("expected an EIS schema conflict");
+    };
+    let details = *details;
+    let electrodata_io::EisSchemaError {
+        row,
+        column,
+        header,
+        candidate_roles,
+        conflicting_role,
+        diagnostics,
+        ..
+    } = details;
+    assert_eq!((row, column, header.as_str()), (1, 2, "Z' + Z\""));
+    assert_eq!(
+        candidate_roles,
+        [ColumnRole::ImpedanceReal, ColumnRole::ImpedanceImaginary]
+    );
+    assert_eq!(conflicting_role, None);
+    assert_eq!(diagnostics[0].candidate_roles, candidate_roles);
+    assert_eq!(
+        diagnostics[0].resolution.as_deref(),
+        Some("rejected: ambiguous EIS header")
+    );
+}
+
+#[test]
+fn eis_header_roles_are_semantic_optional_columns_remain_measured_and_unknowns_are_retained() {
+    let cases = [
+        (
+            "frequency/Hz,real impedance/ohm,imaginary impedance/ohm",
+            "1000,10,-1\n100,15,-5\n10,20,-10",
+            [0, 1, 2],
+            None,
+            None,
+        ),
+        (
+            "Zre/ohm,Zim/ohm,freq/Hz,magnitude/ohm",
+            "10,-1,1000,10.049876\n15,-5,100,15.811388\n20,-10,10,22.360680",
+            [2, 0, 1],
+            Some(3),
+            None,
+        ),
+        (
+            "Phase Angle/deg,Frequency/Hz,Z\"/ohm,Z'/ohm",
+            "-5.710593,1000,-1,10\n-18.434949,100,-5,15\n-26.565051,10,-10,20",
+            [1, 3, 2],
+            None,
+            Some(0),
+        ),
+        (
+            "|Z|/ohm,phase/deg,FREQ/Hz,Real Impedance/ohm,Imaginary Impedance/ohm",
+            "10.049876,-5.710593,1000,10,-1\n15.811388,-18.434949,100,15,-5\n22.360680,-26.565051,10,20,-10",
+            [2, 3, 4],
+            Some(0),
+            Some(1),
+        ),
+        (
+            "Zim/ohm,Zmod/ohm,Zre/ohm,frequency/Hz,Aux/count",
+            "-1,10.049876,10,1000,7\n-5,15.811388,15,100,8\n-10,22.360680,20,10,9",
+            [3, 2, 0],
+            Some(1),
+            None,
+        ),
+    ];
+    for (header, rows, required, magnitude, phase) in cases {
+        let file = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+        std::fs::write(file.path(), format!("{header}\n{rows}\n")).unwrap();
+        let dataset = read(file.path()).unwrap();
+        assert_eq!(dataset.kind(), DatasetKind::ImpedanceSpectrum, "{header}");
+        assert!(dataset.metadata.provenance.detection_confidence >= 0.93);
+        assert_eq!(dataset.canonical_columns().len(), header.split(',').count());
+        assert_eq!(
+            dataset
+                .canonical_columns()
+                .iter()
+                .map(|column| column.original_name.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            header.split(',').collect::<Vec<_>>(),
+            "original headers must remain source-preserved"
+        );
+        assert_eq!(
+            dataset.canonical_columns()[required[0]].role,
+            ColumnRole::Frequency
+        );
+        assert_eq!(
+            dataset.canonical_columns()[required[1]].role,
+            ColumnRole::ImpedanceReal
+        );
+        assert_eq!(
+            dataset.canonical_columns()[required[2]].role,
+            ColumnRole::ImpedanceImaginary
+        );
+        assert_eq!(
+            dataset.canonical_columns()[required[0]].unit,
+            Some(Unit::Hertz)
+        );
+        assert_eq!(
+            dataset.canonical_columns()[required[1]].unit,
+            Some(Unit::Ohm)
+        );
+        assert_eq!(
+            dataset.canonical_columns()[required[2]].unit,
+            Some(Unit::Ohm)
+        );
+        assert_eq!(
+            dataset.f64_values(&ColumnRole::Frequency).unwrap(),
+            &[Some(1000.0), Some(100.0), Some(10.0)]
+        );
+        assert_eq!(
+            dataset.f64_values(&ColumnRole::ImpedanceReal).unwrap(),
+            &[Some(10.0), Some(15.0), Some(20.0)]
+        );
+        assert_eq!(
+            dataset.f64_values(&ColumnRole::ImpedanceImaginary).unwrap(),
+            &[Some(-1.0), Some(-5.0), Some(-10.0)]
+        );
+        assert_eq!(
+            dataset
+                .columns_by_role(&ColumnRole::ImpedanceMagnitude)
+                .first()
+                .copied(),
+            magnitude
+        );
+        assert_eq!(
+            dataset
+                .columns_by_role(&ColumnRole::ImpedancePhase)
+                .first()
+                .copied(),
+            phase
+        );
+        assert!(dataset.diagnostics.is_empty());
+    }
+}
+
+#[test]
+fn eis_optional_missing_cells_preserve_alignment_and_non_eis_shapes_are_not_guessed() {
+    for (header, optional_role) in [
+        (
+            "Freq/Hz,Z'/ohm,Z\"/ohm,Z/ohm",
+            ColumnRole::ImpedanceMagnitude,
+        ),
+        (
+            "Freq/Hz,Z'/ohm,Z\"/ohm,Phase/deg",
+            ColumnRole::ImpedancePhase,
+        ),
+    ] {
+        let file = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            format!("{header}\n1000,10,-1,10\n100,15,-5,\n10,20,-10,20\n"),
+        )
+        .unwrap();
+        let dataset = read(file.path()).unwrap();
+        assert_eq!(dataset.canonical_columns().len(), 4);
+        assert_eq!(dataset.f64_values(&optional_role).unwrap()[1], None);
+        let view = dataset.eis_view().unwrap();
+        let values = if optional_role == ColumnRole::ImpedanceMagnitude {
+            view.magnitude_values()
+        } else {
+            view.phase_values()
+        };
+        assert_eq!(values[1], None, "measured null must not be derived");
+    }
+
+    let non_eis = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        non_eis.path(),
+        "Frequency/Hz,Magnitude/ohm,Phase/deg\n1000,10,-5\n100,15,-10\n10,20,-15\n",
+    )
+    .unwrap();
+    assert_ne!(
+        detect_format(non_eis.path()).unwrap().format,
+        electrodata_io::ElectroDataFormat::ChiEis
+    );
+    assert_eq!(
+        read(non_eis.path()).unwrap().kind(),
+        DatasetKind::GenericTable
+    );
+
+    let headerless = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(headerless.path(), "1000,10,-1\n100,15,-5\n10,20,-10\n").unwrap();
+    assert_ne!(
+        detect_format(headerless.path()).unwrap().format,
+        electrodata_io::ElectroDataFormat::ChiEis
+    );
+}
+
+#[test]
+fn individual_recovery_policy_updates_diagnostic_profile() {
+    let options = ReadOptions::new().with_invalid_cell_policy(InvalidCellPolicy::Null);
+    let dataset = read_with_options(fixture("regular_invalid_numeric.csv"), &options).unwrap();
+    assert!(
+        dataset
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.profile == ReadProfile::Compatibility)
+    );
+    assert_eq!(
+        dataset.metadata.provenance.read_options.profile,
+        ReadProfile::Compatibility
+    );
+    assert_eq!(
+        dataset.metadata.provenance.read_options.invalid_time_policy,
+        InvalidTimePolicy::Error
+    );
+}
+
+#[test]
+fn lossy_utf8_has_explicit_recovery_action() {
+    let file = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(file.path(), b"Time/s,Potenti\xffal/V\n0,1\n1,2\n2,3\n").unwrap();
+    let mut options = ReadOptions::new();
+    options.allow_lossy_utf8 = true;
+    let dataset = read_with_options(file.path(), &options).unwrap();
+    let diagnostic = dataset
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == DiagnosticCode::LossyDecoding)
+        .unwrap();
+    assert_eq!(diagnostic.recovery, RecoveryAction::LossyDecoded);
+    assert_eq!(
+        dataset.metadata.provenance.encoding,
+        Some(TextEncoding::Utf8Lossy)
+    );
+}
+
+#[test]
+fn legacy_xls_is_explicitly_unsupported() {
+    let file = tempfile::Builder::new().suffix(".xls").tempfile().unwrap();
+    std::fs::write(
+        file.path(),
+        [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1],
+    )
+    .unwrap();
+    let error = read(file.path()).unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::UnsupportedContainer);
+    assert_eq!(error.path(), Some(file.path()));
+}
+
+#[test]
+fn supported_legacy_surfaces_still_compile_and_run() {
+    let dataset = electrodata_io::read_regular(fixture("regular_two_column.csv")).unwrap();
+    assert_eq!(dataset.data.shape(), (3, 2));
+    assert_eq!(ColumnRole::Phase, ColumnRole::ImpedancePhase);
+    assert_eq!(
+        ColumnRole::PotentialChannel(5),
+        ColumnRole::MeasurementChannel(5)
+    );
+
+    let channels =
+        electrodata_io::read_chi_multichannel_ocpt(fixture("chi_multichannel_ocpt.csv")).unwrap();
+    assert_eq!(channels.channel(5).unwrap().len(), 3);
+}

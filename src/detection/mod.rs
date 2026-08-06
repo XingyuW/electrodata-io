@@ -65,6 +65,8 @@ pub struct DetectionResult {
     pub column_count: usize,
     /// Original-text-derived evidence used for selection.
     pub matched_patterns: Vec<String>,
+    /// Workbook worksheet that produced this candidate, when applicable.
+    pub worksheet: Option<String>,
 }
 
 impl DetectionResult {
@@ -76,6 +78,7 @@ impl DetectionResult {
             data_start_row: detection.layout.data_start_row,
             column_count: detection.layout.expected_column_count,
             matched_patterns: detection.evidence.clone(),
+            worksheet: None,
         })
     }
 }
@@ -104,6 +107,7 @@ pub(crate) fn select(
         .is_some_and(|second| best.confidence - second.confidence < options.detection_margin)
     {
         return Err(Error::AmbiguousDetection {
+            path: path.to_path_buf(),
             candidates: candidates
                 .iter()
                 .take(3)
