@@ -978,6 +978,10 @@ fn explicit_incomplete_eis_reaches_structured_required_role_validation() {
                 ]
             );
             assert_eq!(diagnostics.len(), 1);
+            assert_eq!(
+                diagnostics[0].source_headers,
+                ["Freq/Hz", "Z/ohm", "Phase/deg"]
+            );
             assert_eq!(diagnostics[0].code, DiagnosticCode::EisSchema);
             assert_eq!(diagnostics[0].row, Some(3));
             assert_eq!(diagnostics[0].format_candidate, Some(FormatId::ChiEis));

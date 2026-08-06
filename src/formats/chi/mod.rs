@@ -14,7 +14,7 @@ pub(crate) struct ChiEisHandler;
 /// EIS selection has different evidence requirements when the caller already
 /// selected the format than when the reader is classifying an unknown table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EisDetectionMode {
+enum EisDispatchMode {
     Automatic,
     Forced,
 }
@@ -79,15 +79,38 @@ fn eis_header_and_data(
     Some((header, data))
 }
 
-/// A forced EIS read needs enough header semantics to identify a table as EIS,
-/// but deliberately leaves required-role completeness to `validate_eis_schema`.
-fn forced_eis_schema_candidate(row: &[String]) -> bool {
-    row.len() >= 2
-        && row
-            .iter()
-            .flat_map(|value| eis_header_candidates(value))
-            .count()
-            >= 2
+/// Selects the source header for an explicitly requested EIS read without
+/// applying automatic-detection confidence or completeness requirements.
+///
+/// A row containing any recognized EIS role wins. When no semantic role is
+/// recognized, the first multi-column text row is treated as the header so
+/// `validate_eis_schema` can report the deterministic first missing role with
+/// an empty detected-role collection and the original source headers.
+fn forced_eis_header_and_data(probe: &Probe) -> Option<(usize, usize)> {
+    let header = probe
+        .rows
+        .iter()
+        .position(|row| {
+            row.iter()
+                .any(|value| !eis_header_candidates(value).is_empty())
+        })
+        .or_else(|| {
+            probe.rows.iter().position(|row| {
+                row.len() >= 2
+                    && row.iter().all(|cell| {
+                        let value = trim_cell(cell);
+                        !value.is_empty() && value.parse::<f64>().is_err()
+                    })
+            })
+        })?;
+    let data = probe
+        .rows
+        .iter()
+        .enumerate()
+        .skip(header + 1)
+        .find(|(_, row)| row.iter().any(|cell| !trim_cell(cell).is_empty()))
+        .map_or(header + 1, |(index, _)| index);
+    Some((header, data))
 }
 
 fn numeric_row(row: &[String], expected: usize) -> bool {
@@ -357,6 +380,7 @@ pub(crate) fn validate_eis_schema(
                 )
                 .at(header_index + 1, None)
                 .with_candidate_roles(Vec::new())
+                .with_source_headers(header.to_vec())
                 .with_resolution("rejected: missing required EIS role"),
             );
             return Err(Error::MissingRequiredRole {
@@ -377,31 +401,26 @@ impl FormatHandler for ChiEisHandler {
     }
     fn detect(&self, probe: &Probe, options: &ReadOptions) -> Option<Detection> {
         let mode = if options.forced_format.as_ref() == Some(&FormatId::ChiEis) {
-            EisDetectionMode::Forced
+            EisDispatchMode::Forced
         } else {
-            EisDetectionMode::Automatic
+            EisDispatchMode::Automatic
         };
         let technique = technique_row(probe, eis_technique).map(|(_, technique)| technique);
-        let (header, data) = eis_header_and_data(probe, |row| {
-            match mode {
+        let (header, data) = match mode {
+            EisDispatchMode::Automatic => eis_header_and_data(probe, |row| {
                 // Preserve automatic confidence requirements: a generic
                 // two-column table with one EIS-like header is not EIS.
-                EisDetectionMode::Automatic => {
-                    let explicit_two_column_header = technique.is_some()
-                        && row.len() == 2
-                        && row
-                            .iter()
-                            .any(|value| !eis_header_candidates(value).is_empty());
-                    eis_schema_candidate(row)
-                        || (technique.is_some() && row.len() >= 3)
-                        || explicit_two_column_header
-                }
-                // The caller selected EIS. Two semantic roles identify the
-                // header; missing required roles are reported structurally by
-                // `validate_eis_schema` during assembly.
-                EisDetectionMode::Forced => forced_eis_schema_candidate(row),
-            }
-        })?;
+                let explicit_two_column_header = technique.is_some()
+                    && row.len() == 2
+                    && row
+                        .iter()
+                        .any(|value| !eis_header_candidates(value).is_empty());
+                eis_schema_candidate(row)
+                    || (technique.is_some() && row.len() >= 3)
+                    || explicit_two_column_header
+            }),
+            EisDispatchMode::Forced => forced_eis_header_and_data(probe),
+        }?;
         let header_row = probe.row(header)?;
         let width = header_row.len();
         let roles: Vec<_> = header_row

@@ -16,6 +16,7 @@ fn assert_missing_required_role(
     path: &Path,
     expected_role: ColumnRole,
     expected_detected_roles: &[ColumnRole],
+    expected_source_headers: &[&str],
 ) {
     assert!(StdError::source(&error).is_none());
     match error {
@@ -32,6 +33,7 @@ fn assert_missing_required_role(
             assert_eq!(detected_roles, expected_detected_roles);
             assert_eq!(diagnostics.len(), 1);
             let diagnostic = &diagnostics[0];
+            assert_eq!(diagnostic.source_headers, expected_source_headers);
             assert_eq!(diagnostic.code, DiagnosticCode::EisSchema);
             assert_eq!(diagnostic.severity, Severity::Error);
             assert_eq!(diagnostic.path.as_deref(), path.to_str());
@@ -60,6 +62,7 @@ fn read_with_options_preserves_missing_frequency_fields() {
             ColumnRole::ImpedanceImaginary,
             ColumnRole::ImpedanceMagnitude,
         ],
+        &["Z'/ohm", "Z\"/ohm", "Z/ohm"],
     );
 }
 
@@ -77,6 +80,7 @@ fn read_preserves_missing_real_impedance_fields() {
             ColumnRole::ImpedanceImaginary,
             ColumnRole::ImpedanceMagnitude,
         ],
+        &["Freq/Hz", "Z\"/ohm", "Z/ohm"],
     );
 }
 
@@ -98,44 +102,161 @@ fn public_reads_preserve_two_column_missing_imaginary_impedance_fields() {
             file.path(),
             ColumnRole::ImpedanceImaginary,
             &[ColumnRole::Frequency, ColumnRole::ImpedanceReal],
+            &["Freq/Hz", "Z'/ohm"],
         );
     }
 }
 
 #[test]
-fn forced_eis_two_column_headers_reach_required_role_validation() {
+fn forced_eis_public_api_validates_zero_through_five_recognized_roles() {
     let cases = [
         (
-            "Freq/Hz,Z'/ohm\n1,100\n10,80\n",
-            ColumnRole::ImpedanceImaginary,
-            vec![ColumnRole::Frequency, ColumnRole::ImpedanceReal],
+            "zero roles",
+            "Potential/V,Current/A",
+            "1,2\n2,3\n",
+            Some((ColumnRole::Frequency, vec![])),
         ),
         (
-            "Freq/Hz,Z\"/ohm\n1,-20\n10,-10\n",
-            ColumnRole::ImpedanceReal,
-            vec![ColumnRole::Frequency, ColumnRole::ImpedanceImaginary],
+            "frequency only",
+            "Freq/Hz,Value",
+            "1,100\n10,80\n",
+            Some((ColumnRole::ImpedanceReal, vec![ColumnRole::Frequency])),
         ),
         (
-            "Z'/ohm,Z\"/ohm\n100,-20\n80,-10\n",
-            ColumnRole::Frequency,
-            vec![ColumnRole::ImpedanceReal, ColumnRole::ImpedanceImaginary],
+            "real only",
+            "Z'/ohm,Value",
+            "100,1\n80,2\n",
+            Some((ColumnRole::Frequency, vec![ColumnRole::ImpedanceReal])),
+        ),
+        (
+            "imaginary only",
+            "Z''/ohm,Value",
+            "-20,1\n-10,2\n",
+            Some((ColumnRole::Frequency, vec![ColumnRole::ImpedanceImaginary])),
+        ),
+        (
+            "frequency and real",
+            "Freq/Hz,Z'/ohm",
+            "1,100\n10,80\n",
+            Some((
+                ColumnRole::ImpedanceImaginary,
+                vec![ColumnRole::Frequency, ColumnRole::ImpedanceReal],
+            )),
+        ),
+        (
+            "frequency and imaginary",
+            "Freq/Hz,Z''/ohm",
+            "1,-20\n10,-10\n",
+            Some((
+                ColumnRole::ImpedanceReal,
+                vec![ColumnRole::Frequency, ColumnRole::ImpedanceImaginary],
+            )),
+        ),
+        (
+            "real and imaginary",
+            "Z'/ohm,Z''/ohm",
+            "100,-20\n80,-10\n",
+            Some((
+                ColumnRole::Frequency,
+                vec![ColumnRole::ImpedanceReal, ColumnRole::ImpedanceImaginary],
+            )),
+        ),
+        (
+            "three required roles",
+            "Freq/Hz,Z'/ohm,Z''/ohm",
+            "1,100,-20\n10,80,-10\n",
+            None,
+        ),
+        (
+            "required roles and magnitude",
+            "Freq/Hz,Z'/ohm,Z''/ohm,Z/ohm",
+            "1,100,-20,102\n10,80,-10,81\n",
+            None,
+        ),
+        (
+            "required roles and phase",
+            "Freq/Hz,Z'/ohm,Z''/ohm,Phase/deg",
+            "1,100,-20,-11\n10,80,-10,-7\n",
+            None,
+        ),
+        (
+            "all five roles",
+            "Freq/Hz,Z'/ohm,Z''/ohm,Z/ohm,Phase/deg",
+            "1,100,-20,102,-11\n10,80,-10,81,-7\n",
+            None,
+        ),
+        (
+            "reordered complete roles",
+            "Phase/deg,Z''/ohm,Freq/Hz,Z/ohm,Z'/ohm",
+            "-11,-20,1,102,100\n-7,-10,10,81,80\n",
+            None,
         ),
     ];
 
-    for (contents, missing_role, detected_roles) in cases {
-        let file = temporary_csv(contents);
-        let error = read_chi_eis(file.path()).unwrap_err();
-        assert_missing_required_role(error, file.path(), missing_role, &detected_roles);
+    for (name, header, rows, expected_error) in cases {
+        let file = temporary_csv(&format!("{header}\n{rows}"));
+        let result = read_chi_eis(file.path());
+        if let Some((missing_role, detected_roles)) = expected_error {
+            let source_headers: Vec<_> = header.split(',').collect();
+            assert_missing_required_role(
+                result.unwrap_err(),
+                file.path(),
+                missing_role,
+                &detected_roles,
+                &source_headers,
+            );
+        } else {
+            let dataset = result.unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            assert_eq!(dataset.kind(), DatasetKind::ImpedanceSpectrum, "{name}");
+            assert_eq!(
+                dataset
+                    .canonical_columns()
+                    .iter()
+                    .map(|column| column.original_name.as_deref().unwrap())
+                    .collect::<Vec<_>>(),
+                header.split(',').collect::<Vec<_>>(),
+                "{name}"
+            );
+            assert!(
+                dataset
+                    .canonical_columns()
+                    .iter()
+                    .all(|column| column.role != ColumnRole::Unknown),
+                "{name}"
+            );
+            let view = dataset
+                .eis_view()
+                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            assert_eq!(view.frequency.values.len(), 2, "{name}");
+            assert_eq!(view.real.values.len(), 2, "{name}");
+            assert_eq!(view.imaginary.values.len(), 2, "{name}");
+            assert_eq!(
+                view.measured_magnitude.is_some(),
+                header.split(',').any(|source| source == "Z/ohm"),
+                "{name}"
+            );
+            assert_eq!(
+                view.measured_phase.is_some(),
+                header.split(',').any(|source| source == "Phase/deg"),
+                "{name}"
+            );
+        }
     }
 }
 
 #[test]
-fn incomplete_two_column_eis_headers_remain_non_eis_automatically() {
-    for contents in [
+fn incomplete_eis_headers_remain_non_eis_automatically() {
+    let cases = [
+        "Potential/V,Current/A\n1,2\n2,3\n",
+        "Freq/Hz,Value\n1,100\n10,80\n",
+        "Z'/ohm,Value\n100,1\n80,2\n",
+        "Z''/ohm,Value\n-20,1\n-10,2\n",
         "Freq/Hz,Z'/ohm\n1,100\n10,80\n",
-        "Freq/Hz,Z\"/ohm\n1,-20\n10,-10\n",
-        "Z'/ohm,Z\"/ohm\n100,-20\n80,-10\n",
-    ] {
+        "Freq/Hz,Z''/ohm\n1,-20\n10,-10\n",
+        "Z'/ohm,Z''/ohm\n100,-20\n80,-10\n",
+    ];
+
+    for contents in cases {
         let file = temporary_csv(contents);
         assert_ne!(
             electrodata_io::detect_format(file.path()).unwrap().format,

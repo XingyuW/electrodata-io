@@ -113,6 +113,8 @@ pub struct Diagnostic {
     pub profile: ReadProfile,
     /// Exact EIS roles recognized from this header, if EIS schema resolution was attempted.
     pub candidate_roles: Vec<ColumnRole>,
+    /// Exact source header cells considered during schema validation.
+    pub source_headers: Vec<String>,
     /// Explicit schema resolution or rejection decision, when applicable.
     pub resolution: Option<String>,
 }
@@ -137,6 +139,7 @@ impl Diagnostic {
             format_candidate: None,
             profile: ReadProfile::Strict,
             candidate_roles: Vec::new(),
+            source_headers: Vec::new(),
             resolution: None,
         }
     }
@@ -164,6 +167,11 @@ impl Diagnostic {
 
     pub(crate) fn with_candidate_roles(mut self, candidate_roles: Vec<ColumnRole>) -> Self {
         self.candidate_roles = candidate_roles;
+        self
+    }
+
+    pub(crate) fn with_source_headers(mut self, source_headers: Vec<String>) -> Self {
+        self.source_headers = source_headers;
         self
     }
 
