@@ -11,7 +11,9 @@ dataset_kind = "TimeSeries"
 row_count = 3
 column_count = 2
 missing_value_count = 0
-expected_diagnostics = []
+expected_diagnostics = [
+  { code = "RowClassification", severity = "info", row = 1, column = "*", action = "HeaderInterpreted" },
+]
 strict_mode_result = "accept"
 compatibility_mode_result = "accept"
 columns = [
@@ -25,7 +27,9 @@ dataset_kind = "TimeSeries"
 row_count = 3
 column_count = 5
 missing_value_count = 0
-expected_diagnostics = []
+expected_diagnostics = [
+  { code = "RowClassification", severity = "info", row = 1, column = "*", action = "HeaderInterpreted" },
+]
 strict_mode_result = "accept"
 compatibility_mode_result = "accept"
 columns = [
@@ -60,6 +64,7 @@ row_count = 4
 column_count = 3
 missing_value_count = 2
 expected_diagnostics = [
+  { code = "RowClassification", severity = "info", row = 1, column = "*", action = "HeaderInterpreted" },
   { code = "MissingValue", severity = "warning", row = 3, column = "Potential/V", action = "Preserved" },
   { code = "MissingValue", severity = "warning", row = 4, column = "Current/A", action = "Preserved" },
 ]
@@ -78,6 +83,7 @@ row_count = 2
 column_count = 2
 missing_value_count = 0
 expected_diagnostics = [
+  { code = "RowClassification", severity = "info", row = 1, column = "*", action = "HeaderInterpreted" },
   { code = "MalformedTimestamp", severity = "warning", row = 3, column = "Time/sec", action = "RowSkipped" },
   { code = "RowSkipped", severity = "warning", row = 3, column = "Time/sec", action = "RowSkipped" },
 ]
@@ -95,6 +101,7 @@ row_count = 3
 column_count = 3
 missing_value_count = 1
 expected_diagnostics = [
+  { code = "RowClassification", severity = "info", row = 1, column = "*", action = "HeaderInterpreted" },
   { code = "RaggedRow", severity = "warning", row = 3, column = "*", action = "None" },
   { code = "RowPadded", severity = "warning", row = 3, column = "Temperature/C", action = "RowPadded" },
   { code = "RaggedRow", severity = "warning", row = 4, column = "*", action = "None" },
@@ -115,6 +122,7 @@ row_count = 3
 column_count = 2
 missing_value_count = 1
 expected_diagnostics = [
+  { code = "RowClassification", severity = "info", row = 1, column = "*", action = "HeaderInterpreted" },
   { code = "MalformedNumeric", severity = "warning", row = 3, column = "Potential/V", action = "ValueReplacedWithMissing" },
   { code = "ValueReplacedWithMissing", severity = "warning", row = 3, column = "Potential/V", action = "ValueReplacedWithMissing" },
 ]
@@ -132,6 +140,7 @@ row_count = 4
 column_count = 2
 missing_value_count = 0
 expected_diagnostics = [
+  { code = "RowClassification", severity = "info", row = 1, column = "*", action = "HeaderInterpreted" },
   { code = "DuplicateTimestamp", severity = "warning", row = 4, column = "Time/sec", action = "Preserved" },
 ]
 strict_mode_result = "reject: DuplicateTimestamp at source row 4"
@@ -148,6 +157,7 @@ row_count = 4
 column_count = 2
 missing_value_count = 0
 expected_diagnostics = [
+  { code = "RowClassification", severity = "info", row = 1, column = "*", action = "HeaderInterpreted" },
   { code = "NonMonotonicTimestamp", severity = "warning", row = 4, column = "Time/sec", action = "Preserved" },
 ]
 strict_mode_result = "reject: NonMonotonicTimestamp at source row 4"
@@ -163,7 +173,9 @@ dataset_kind = "TimeSeries"
 row_count = 3
 column_count = 3
 missing_value_count = 0
-expected_diagnostics = []
+expected_diagnostics = [
+  { code = "RowClassification", severity = "info", row = 1, column = "*", action = "HeaderInterpreted" },
+]
 strict_mode_result = "accept"
 compatibility_mode_result = "accept"
 columns = [
@@ -272,7 +284,9 @@ dataset_kind = "TimeSeries"
 row_count = 3
 column_count = 3
 missing_value_count = 0
-expected_diagnostics = []
+expected_diagnostics = [
+  { code = "RowClassification", severity = "info", row = 1, column = "*", action = "HeaderInterpreted" },
+]
 strict_mode_result = "accept: auto-select the sole compatible worksheet named measurement"
 compatibility_mode_result = "accept: auto-select the sole compatible worksheet named measurement"
 columns = [

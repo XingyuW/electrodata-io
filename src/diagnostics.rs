@@ -30,6 +30,9 @@ pub enum RecoveryAction {
     Preserved,
     RolesInferred,
     LossyDecoded,
+    HeaderInterpreted,
+    MetadataPreserved,
+    EmptyRowIgnored,
 }
 
 /// Stable machine-readable diagnostic identifier.
@@ -46,6 +49,7 @@ pub enum DiagnosticCode {
     RowPadded,
     ExtraCellsIgnored,
     HeaderlessRoleInference,
+    RowClassification,
     UnknownUnit,
     DuplicateTimestamp,
     NonMonotonicTimestamp,

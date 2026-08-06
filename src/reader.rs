@@ -1,8 +1,8 @@
 //! Registry-based reader orchestration.
 
 use crate::formats::{
-    ChiEisHandler, ChiMultichannelOcptHandler, ChiOcptHandler, Detection, FormatHandler,
-    RegularXyHandler,
+    ChiEisHandler, ChiMultichannelOcptHandler, ChiOcptHandler, Detection, FirstRowClassification,
+    FormatHandler, RegularXyHandler, classify_first_row, explicit_comment_row,
 };
 use crate::metadata::{
     AcquisitionMetadata, FormulaCacheStatus, FormulaProvenance, Metadata, MetadataValue, Parameter,
@@ -277,11 +277,25 @@ impl DataReader {
                 }
             }
         }
+        let mut diagnostics: Vec<Diagnostic> = source_diagnostics
+            .into_iter()
+            .map(|diagnostic| {
+                diagnostic.with_context(
+                    path,
+                    probe.worksheet_name.as_deref(),
+                    &detection.format,
+                    options.effective_profile(),
+                )
+            })
+            .collect();
+        diagnostics.append(&mut regular_row_classification_diagnostics(
+            path, &probe, &rows, &detection, options,
+        )?);
         if !detection.layout.has_header && !options.permits_headerless_inference() {
             return Err(Error::AmbiguousHeaderlessSchema {
                 path: path.to_path_buf(),
                 format_candidate: Some(detection.format.clone()),
-                diagnostics: Vec::new(),
+                diagnostics,
             });
         }
         let mut decoded = numeric_frame(
@@ -297,10 +311,13 @@ impl DataReader {
             },
         )
         .map_err(|error| {
-            error.with_read_context(
+            let mut accrued = diagnostics.clone();
+            accrued.extend_from_slice(error.diagnostics());
+            error.with_read_context_and_diagnostics(
                 path,
                 probe.worksheet_name.as_deref(),
                 Some(detection.format.clone()),
+                accrued,
             )
         })?;
         let metadata = parse_metadata(
@@ -317,17 +334,6 @@ impl DataReader {
                 source_sha256,
             },
         );
-        let mut diagnostics: Vec<Diagnostic> = source_diagnostics
-            .into_iter()
-            .map(|diagnostic| {
-                diagnostic.with_context(
-                    path,
-                    probe.worksheet_name.as_deref(),
-                    &detection.format,
-                    options.effective_profile(),
-                )
-            })
-            .collect();
         diagnostics.append(&mut decoded.diagnostics);
         if !detection.layout.has_header {
             diagnostics.push(
@@ -338,7 +344,10 @@ impl DataReader {
                     options,
                     Severity::Warning,
                     DiagnosticCode::HeaderlessRoleInference,
-                    "headerless schema inferred: first column is Time and remaining columns are Unknown",
+                    format!(
+                        "first table row classified as numeric/missing data by {:?}; headerless schema inferred with first column Time and remaining columns Unknown",
+                        options.header_policy
+                    ),
                 )
                 .at(detection.layout.data_start_row + 1, None)
                 .recovered(RecoveryAction::RolesInferred),
@@ -366,17 +375,139 @@ impl DataReader {
             decoded.source_rows,
             decoded.source_data_row_count,
         );
-        validate_coordinate_order(path, &dataset, options, &mut diagnostics)?;
-        validation::validate(&dataset, options, &mut diagnostics).map_err(|error| {
-            error.with_read_context(
+        validate_coordinate_order(path, &dataset, options, &mut diagnostics).map_err(|error| {
+            error.with_read_context_and_diagnostics(
                 path,
                 probe.worksheet_name.as_deref(),
                 Some(detection.format.clone()),
+                diagnostics.clone(),
+            )
+        })?;
+        validation::validate(&dataset, options, &mut diagnostics).map_err(|error| {
+            error.with_read_context_and_diagnostics(
+                path,
+                probe.worksheet_name.as_deref(),
+                Some(detection.format.clone()),
+                diagnostics.clone(),
             )
         })?;
         dataset.diagnostics = diagnostics;
         Ok(dataset)
     }
+}
+
+fn regular_row_classification_diagnostics(
+    path: &Path,
+    probe: &Probe,
+    rows: &[Vec<String>],
+    detection: &Detection,
+    options: &ReadOptions,
+) -> Result<Vec<Diagnostic>> {
+    if detection.format != crate::FormatId::RegularXy {
+        return Ok(Vec::new());
+    }
+    let table_row = detection
+        .layout
+        .header_row
+        .unwrap_or(detection.layout.data_start_row);
+    let mut diagnostics = Vec::new();
+    for (index, row) in rows.iter().enumerate().take(table_row) {
+        let source_row = index + 1;
+        if row.is_empty() || row.iter().all(|cell| cell.trim().is_empty()) {
+            diagnostics.push(
+                diagnostic(
+                    path,
+                    probe.worksheet_name.as_deref(),
+                    &detection.format,
+                    options,
+                    Severity::Info,
+                    DiagnosticCode::RowClassification,
+                    format!(
+                        "source row classified as empty before the table by {:?}; row ignored",
+                        options.header_policy
+                    ),
+                )
+                .at(source_row, None)
+                .recovered(RecoveryAction::EmptyRowIgnored),
+            );
+        } else if explicit_comment_row(row) {
+            diagnostics.push(
+                diagnostic(
+                    path,
+                    probe.worksheet_name.as_deref(),
+                    &detection.format,
+                    options,
+                    Severity::Info,
+                    DiagnosticCode::RowClassification,
+                    format!(
+                        "source row classified by explicit # or // comment syntax under {:?}; row preserved as metadata",
+                        options.header_policy
+                    ),
+                )
+                .at(source_row, None)
+                .recovered(RecoveryAction::MetadataPreserved),
+            );
+        }
+    }
+
+    let row = probe
+        .row(table_row)
+        .or_else(|| rows.get(table_row).map(Vec::as_slice))
+        .ok_or(Error::EmptyData)?;
+    let content_classification = classify_first_row(row);
+    if options.header_policy == crate::HeaderPolicy::Auto
+        && matches!(content_classification, FirstRowClassification::Ambiguous(_))
+        && options.effective_profile() == crate::ReadProfile::Strict
+    {
+        let FirstRowClassification::Ambiguous(reason) = content_classification else {
+            unreachable!();
+        };
+        diagnostics.push(
+            diagnostic(
+                path,
+                probe.worksheet_name.as_deref(),
+                &detection.format,
+                options,
+                Severity::Error,
+                DiagnosticCode::RowClassification,
+                format!("first table row is ambiguous: {reason}; no recovery was applied"),
+            )
+            .at(table_row + 1, None),
+        );
+        return Err(Error::AmbiguousFirstRow {
+            path: path.to_path_buf(),
+            format_candidate: Some(detection.format.clone()),
+            row: table_row + 1,
+            reason: reason.into(),
+            policy: options.header_policy,
+            diagnostics,
+        });
+    }
+
+    if detection.layout.has_header {
+        let (reason, severity) = match content_classification {
+            FirstRowClassification::Header(reason) => (reason, Severity::Info),
+            FirstRowClassification::Data(reason) => (reason, Severity::Warning),
+            FirstRowClassification::Ambiguous(reason) => (reason, Severity::Warning),
+        };
+        diagnostics.push(
+            diagnostic(
+                path,
+                probe.worksheet_name.as_deref(),
+                &detection.format,
+                options,
+                severity,
+                DiagnosticCode::RowClassification,
+                format!(
+                    "source row interpreted as the table header by {:?}: {reason}",
+                    options.header_policy
+                ),
+            )
+            .at(table_row + 1, None)
+            .recovered(RecoveryAction::HeaderInterpreted),
+        );
+    }
+    Ok(diagnostics)
 }
 
 impl DataReaderBuilder {

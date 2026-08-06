@@ -37,7 +37,7 @@ fn structural(dataset: &Dataset) -> Result<()> {
                 column.name
             )));
         }
-        if column.values.iter().all(Option::is_none) {
+        if required_non_null_role(&column.role) && column.values.iter().all(Option::is_none) {
             return Err(Error::InvalidColumnSignature(format!(
                 "{} is entirely null",
                 column.name
@@ -45,6 +45,16 @@ fn structural(dataset: &Dataset) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn required_non_null_role(role: &crate::ColumnRole) -> bool {
+    matches!(
+        role,
+        crate::ColumnRole::Time
+            | crate::ColumnRole::Frequency
+            | crate::ColumnRole::ImpedanceReal
+            | crate::ColumnRole::ImpedanceImaginary
+    )
 }
 
 #[cfg(feature = "scientific-validation")]

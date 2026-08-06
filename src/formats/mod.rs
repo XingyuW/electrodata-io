@@ -10,7 +10,9 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 pub(crate) use chi::{ChiEisHandler, ChiMultichannelOcptHandler, ChiOcptHandler};
-pub(crate) use regular_xy::RegularXyHandler;
+pub(crate) use regular_xy::{
+    FirstRowClassification, RegularXyHandler, classify_first_row, explicit_comment_row,
+};
 
 /// Stable identifier for a scientific format, independent of storage.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

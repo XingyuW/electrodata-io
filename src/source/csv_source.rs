@@ -132,7 +132,10 @@ pub(crate) fn probe(path: &Path, probe_limit: usize) -> Result<Probe> {
 fn detect_delimiter(lines: &[String]) -> u8 {
     let samples: Vec<&str> = lines
         .iter()
-        .filter(|line| !line.trim().is_empty())
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('#') && !line.starts_with("//")
+        })
         .take(64)
         .map(String::as_str)
         .collect();

@@ -6,6 +6,47 @@ use std::collections::HashMap;
 /// Compatibility format id backed by the generalized N-column table handler.
 pub(crate) struct RegularXyHandler;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FirstRowClassification {
+    Header(&'static str),
+    Data(&'static str),
+    Ambiguous(&'static str),
+}
+
+pub(crate) fn explicit_comment_row(row: &[String]) -> bool {
+    row.first().is_some_and(|cell| {
+        let value = trim_cell(cell);
+        value.starts_with('#') || value.starts_with("//")
+    })
+}
+
+pub(crate) fn classify_first_row(row: &[String]) -> FirstRowClassification {
+    let mut numeric_cells = 0;
+    let mut missing_cells = 0;
+    let mut text_cells = 0;
+    for cell in row {
+        let value = trim_cell(cell);
+        if value.is_empty() || missing_token(value) {
+            missing_cells += 1;
+        } else if numeric(value) {
+            numeric_cells += 1;
+        } else {
+            text_cells += 1;
+        }
+    }
+    match (numeric_cells, missing_cells, text_cells) {
+        (numeric, _, 0) if numeric > 0 => {
+            FirstRowClassification::Data("every non-missing cell is a parseable numeric token")
+        }
+        (0, 0, text) if text > 0 => {
+            FirstRowClassification::Header("every cell is a non-numeric header token")
+        }
+        _ => FirstRowClassification::Ambiguous(
+            "the row mixes numeric, missing, and/or non-numeric tokens",
+        ),
+    }
+}
+
 impl FormatHandler for RegularXyHandler {
     fn format_id(&self) -> FormatId {
         FormatId::RegularXy
@@ -21,21 +62,23 @@ impl FormatHandler for RegularXyHandler {
         }) {
             return None;
         }
-        let nonempty: Vec<(usize, &[String])> = probe
+        let table_rows: Vec<(usize, &[String])> = probe
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, row)| row.iter().any(|cell| !trim_cell(cell).is_empty()))
+            .filter(|(_, row)| {
+                row.iter().any(|cell| !trim_cell(cell).is_empty()) && !explicit_comment_row(row)
+            })
             .map(|(index, row)| (index, row.as_slice()))
             .take(8)
             .collect();
-        let (first_index, first) = *nonempty.first()?;
+        let (first_index, first) = *table_rows.first()?;
         if first.len() < 2 {
             return None;
         }
-        let first_numeric = first.iter().all(|cell| numeric(cell));
+        let classification = classify_first_row(first);
         let has_header = match options.header_policy {
-            HeaderPolicy::Auto => !first_numeric,
+            HeaderPolicy::Auto => !matches!(classification, FirstRowClassification::Data(_)),
             HeaderPolicy::Present => true,
             HeaderPolicy::Absent => false,
         };
@@ -57,7 +100,7 @@ impl FormatHandler for RegularXyHandler {
         }
         let width = first.len();
         let data_position = usize::from(has_header);
-        let candidate_rows: Vec<&&[String]> = nonempty
+        let candidate_rows: Vec<&&[String]> = table_rows
             .iter()
             .skip(data_position)
             .take(5)
@@ -80,7 +123,7 @@ impl FormatHandler for RegularXyHandler {
         if candidate_rows.is_empty() || shaped_rows == 0 || numeric_rows == 0 {
             return None;
         }
-        let data_start_row = nonempty.get(data_position)?.0;
+        let data_start_row = table_rows.get(data_position)?.0;
         let semantic_header = has_header
             && first
                 .iter()
@@ -95,6 +138,8 @@ impl FormatHandler for RegularXyHandler {
                 0.78
             } else if candidate_rows.len() > 1 {
                 0.70
+            } else if !has_header {
+                0.65
             } else {
                 0.60
             },
@@ -109,7 +154,7 @@ impl FormatHandler for RegularXyHandler {
             layout: DetectedLayout {
                 header_row: has_header.then_some(first_index),
                 data_start_row,
-                metadata_range: None,
+                metadata_range: (first_index > 0).then_some(0..first_index),
                 expected_column_count: width,
                 has_header,
             },

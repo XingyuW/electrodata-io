@@ -106,6 +106,17 @@ pub enum Error {
         format_candidate: Option<FormatId>,
         diagnostics: Vec<Diagnostic>,
     },
+    #[error(
+        "ambiguous first table row at source row {row} for {path}: {reason} (policy {policy:?})"
+    )]
+    AmbiguousFirstRow {
+        path: PathBuf,
+        format_candidate: Option<FormatId>,
+        row: usize,
+        reason: String,
+        policy: crate::HeaderPolicy,
+        diagnostics: Vec<Diagnostic>,
+    },
     #[error("invalid column signature: {0}")]
     InvalidColumnSignature(String),
     #[error("invalid column count at row {row}: expected {expected}, found {actual}")]
@@ -278,6 +289,7 @@ impl Error {
             | Self::Calamine { .. } => ErrorCategory::Worksheet,
             Self::HeaderNotFound
             | Self::AmbiguousHeaderlessSchema { .. }
+            | Self::AmbiguousFirstRow { .. }
             | Self::InvalidColumnSignature(_)
             | Self::InvalidColumnCount { .. }
             | Self::MissingRequiredRole { .. }
@@ -316,6 +328,7 @@ impl Error {
             | Self::AmbiguousFormat { path, .. }
             | Self::AmbiguousDetection { path, .. }
             | Self::AmbiguousHeaderlessSchema { path, .. }
+            | Self::AmbiguousFirstRow { path, .. }
             | Self::MalformedNumeric { path, .. }
             | Self::RaggedRow { path, .. }
             | Self::MissingCoordinate { path, .. }
@@ -341,6 +354,9 @@ impl Error {
                 format_candidate, ..
             }
             | Self::AmbiguousHeaderlessSchema {
+                format_candidate, ..
+            }
+            | Self::AmbiguousFirstRow {
                 format_candidate, ..
             }
             | Self::MalformedNumeric {
@@ -382,7 +398,8 @@ impl Error {
     pub fn row(&self) -> Option<usize> {
         match self {
             Self::ReadContext { source, .. } => source.row(),
-            Self::InvalidColumnCount { row, .. }
+            Self::AmbiguousFirstRow { row, .. }
+            | Self::InvalidColumnCount { row, .. }
             | Self::MalformedNumeric { row, .. }
             | Self::RaggedRow { row, .. }
             | Self::MissingCoordinate { row, .. }
@@ -428,6 +445,7 @@ impl Error {
             }
             Self::UnsupportedBinary { diagnostics, .. }
             | Self::AmbiguousHeaderlessSchema { diagnostics, .. }
+            | Self::AmbiguousFirstRow { diagnostics, .. }
             | Self::MalformedNumeric { diagnostics, .. }
             | Self::RaggedRow { diagnostics, .. }
             | Self::MissingCoordinate { diagnostics, .. }
@@ -455,6 +473,74 @@ impl Error {
                 diagnostics: Vec::new(),
                 source: Box::new(self),
             }
+        }
+    }
+
+    pub(crate) fn with_read_context_and_diagnostics(
+        mut self,
+        path: &Path,
+        worksheet: Option<&str>,
+        format_candidate: Option<FormatId>,
+        diagnostics: Vec<Diagnostic>,
+    ) -> Self {
+        if self.path().is_some() {
+            if !diagnostics.is_empty() {
+                match &mut self {
+                    Self::ReadContext {
+                        diagnostics: current,
+                        ..
+                    }
+                    | Self::UnsupportedBinary {
+                        diagnostics: current,
+                        ..
+                    }
+                    | Self::AmbiguousHeaderlessSchema {
+                        diagnostics: current,
+                        ..
+                    }
+                    | Self::AmbiguousFirstRow {
+                        diagnostics: current,
+                        ..
+                    }
+                    | Self::MalformedNumeric {
+                        diagnostics: current,
+                        ..
+                    }
+                    | Self::RaggedRow {
+                        diagnostics: current,
+                        ..
+                    }
+                    | Self::MissingCoordinate {
+                        diagnostics: current,
+                        ..
+                    }
+                    | Self::MissingRequiredRole {
+                        diagnostics: current,
+                        ..
+                    }
+                    | Self::DuplicateCoordinate {
+                        diagnostics: current,
+                        ..
+                    }
+                    | Self::NonMonotonicCoordinate {
+                        diagnostics: current,
+                        ..
+                    } => *current = diagnostics,
+                    Self::UnusableFormula {
+                        diagnostics: current,
+                        ..
+                    } => *current = diagnostics.into_boxed_slice(),
+                    _ => {}
+                }
+            }
+            return self;
+        }
+        Self::ReadContext {
+            path: path.to_path_buf(),
+            worksheet: worksheet.map(str::to_owned),
+            format_candidate,
+            diagnostics,
+            source: Box::new(self),
         }
     }
 }

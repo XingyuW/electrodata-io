@@ -268,6 +268,7 @@ fn diagnostic_code_name(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::RowPadded => "RowPadded",
         DiagnosticCode::ExtraCellsIgnored => "ExtraCellsIgnored",
         DiagnosticCode::HeaderlessRoleInference => "HeaderlessRoleInference",
+        DiagnosticCode::RowClassification => "RowClassification",
         DiagnosticCode::UnknownUnit => "UnknownUnit",
         DiagnosticCode::DuplicateTimestamp | DiagnosticCode::DuplicateTime => "DuplicateTimestamp",
         DiagnosticCode::NonMonotonicTimestamp | DiagnosticCode::NonMonotonicTime => {
@@ -300,6 +301,9 @@ fn recovery_name(recovery: RecoveryAction) -> &'static str {
         RecoveryAction::Preserved => "Preserved",
         RecoveryAction::RolesInferred => "RolesInferred",
         RecoveryAction::LossyDecoded => "LossyDecoded",
+        RecoveryAction::HeaderInterpreted => "HeaderInterpreted",
+        RecoveryAction::MetadataPreserved => "MetadataPreserved",
+        RecoveryAction::EmptyRowIgnored => "EmptyRowIgnored",
     }
 }
 
