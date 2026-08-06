@@ -482,8 +482,9 @@ timezone. Bare flags such as `Imp SF` are retained as parameters.
 ## Validation and diagnostics
 
 Structural validation is enabled by default. It checks nonempty data, consistent
-row widths, required roles, numeric columns, and columns that are entirely
-null. Scientific validation is opt-in:
+row widths, required roles, and numeric columns. Entirely-null required
+coordinate/EIS columns are rejected, while entirely-null auxiliary columns may
+remain. Scientific validation is opt-in:
 
 ```rust,no_run
 use electrodata_io::{read_with_options, ReadOptions, ValidationLevel};
@@ -602,7 +603,7 @@ use electrodata_io::{read, Error};
 
 match read("input.csv") {
     Ok(dataset) => println!("loaded {} rows", dataset.data.height()),
-    Err(Error::MalformedNumeric { row, column, value }) => {
+    Err(Error::MalformedNumeric { row, column, value, .. }) => {
         eprintln!("invalid value {value:?} at row {row}, column {column}");
     }
     Err(error) => eprintln!("could not load input: {error}"),
