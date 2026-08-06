@@ -35,6 +35,10 @@ growth that cannot be represented safely by aliases alone.
   source-cell context. Downstream destructuring must use accessor methods such
   as `context()`, `path()`, `row()`, and `column()` and include a wildcard when
   matching the non-exhaustive enum.
+- `MissingRequiredRole` now exposes all detected roles. `UnknownUnit` and
+  `IncompatibleUnit` retain the original source header, and `eis_view()` uses
+  the additive `InvalidDatasetView` error to retain the dataset path and
+  requested view when called for a non-EIS dataset.
 - Canonical `ColumnRole` variants were added. Exhaustive downstream matches must
   include a wildcard. Legacy `Phase` and `PotentialChannel(n)` values remain
   equality-compatible with `ImpedancePhase` and `MeasurementChannel(n)`, but

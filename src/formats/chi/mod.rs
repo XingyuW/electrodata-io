@@ -52,6 +52,25 @@ fn header_and_data(probe: &Probe, predicate: impl Fn(&[String]) -> bool) -> Opti
     Some((header, data))
 }
 
+/// Finds an EIS header and its first non-empty row without requiring the row to
+/// be numerically valid or rectangular. EIS schema evidence is strong enough to
+/// select the handler; the structured decoder must retain malformed-cell and
+/// ragged-row context instead of turning either condition into a detection miss.
+fn eis_header_and_data(
+    probe: &Probe,
+    predicate: impl Fn(&[String]) -> bool,
+) -> Option<(usize, usize)> {
+    let header = probe.rows.iter().position(|row| predicate(row))?;
+    let data = probe
+        .rows
+        .iter()
+        .enumerate()
+        .skip(header + 1)
+        .find(|(_, row)| row.iter().any(|cell| !trim_cell(cell).is_empty()))?
+        .0;
+    Some((header, data))
+}
+
 fn numeric_row(row: &[String], expected: usize) -> bool {
     row.len() == expected
         && row.iter().all(|cell| {
@@ -310,6 +329,7 @@ pub(crate) fn validate_eis_schema(
             .iter()
             .any(|candidate| candidate.as_ref() == Some(&role))
         {
+            let detected_roles = resolved.iter().flatten().cloned().collect();
             let diagnostic = context(
                 Diagnostic::new(
                     Severity::Error,
@@ -324,6 +344,7 @@ pub(crate) fn validate_eis_schema(
                 path: path.to_path_buf(),
                 format_candidate,
                 role,
+                detected_roles,
                 diagnostics: vec![diagnostic],
             });
         }
@@ -337,7 +358,13 @@ impl FormatHandler for ChiEisHandler {
     }
     fn detect(&self, probe: &Probe, _options: &ReadOptions) -> Option<Detection> {
         let technique = technique_row(probe, eis_technique).map(|(_, technique)| technique);
-        let (header, data) = header_and_data(probe, eis_schema_candidate)?;
+        // An explicit A.C. Impedance technique identifies the scientific format even
+        // when its table header is incomplete. Let that table reach
+        // `validate_eis_schema` so callers receive the role-specific structured
+        // schema error instead of an unstructured detection failure.
+        let (header, data) = eis_header_and_data(probe, |row| {
+            eis_schema_candidate(row) || (technique.is_some() && row.len() >= 3)
+        })?;
         let header_row = probe.row(header)?;
         let width = header_row.len();
         let roles: Vec<_> = header_row

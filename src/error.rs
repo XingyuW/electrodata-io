@@ -52,6 +52,13 @@ pub struct EisSchemaError {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// Structured source context for a unit-validation failure.
+#[derive(Debug, Clone)]
+pub struct UnitErrorContext {
+    /// Exact source header when the failure arose from a dataset column.
+    pub source_header: Option<String>,
+}
+
 /// Structured read failure.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -171,6 +178,7 @@ pub enum Error {
         path: PathBuf,
         format_candidate: FormatId,
         role: crate::ColumnRole,
+        detected_roles: Vec<crate::ColumnRole>,
         diagnostics: Vec<Diagnostic>,
     },
     #[error("EIS schema conflict: {details:?}")]
@@ -243,6 +251,12 @@ pub enum Error {
         expected: DatasetKind,
         actual: DatasetKind,
     },
+    #[error("dataset kind {dataset_kind:?} in {path} cannot be viewed as {requested_view}")]
+    InvalidDatasetView {
+        path: PathBuf,
+        requested_view: String,
+        dataset_kind: DatasetKind,
+    },
     #[error("missing value for {role:?} at dataset row {row}")]
     MissingValue {
         path: PathBuf,
@@ -256,6 +270,7 @@ pub enum Error {
         path: PathBuf,
         role: crate::ColumnRole,
         column: Option<usize>,
+        details: Box<UnitErrorContext>,
     },
     #[error("cannot convert {role:?} from {source_unit:?} to {target_unit:?} in {path}")]
     IncompatibleUnit {
@@ -264,6 +279,7 @@ pub enum Error {
         source_unit: crate::Unit,
         target_unit: crate::Unit,
         column: Option<usize>,
+        details: Box<UnitErrorContext>,
     },
 }
 
@@ -325,6 +341,7 @@ impl Error {
             Self::ColumnRoleNotFound(_)
             | Self::ColumnRoleAmbiguous { .. }
             | Self::WrongDatasetKind { .. } => ErrorCategory::Accessor,
+            Self::InvalidDatasetView { .. } => ErrorCategory::Accessor,
         }
     }
 
@@ -355,6 +372,7 @@ impl Error {
             | Self::MissingValue { path, .. }
             | Self::UnknownUnit { path, .. }
             | Self::IncompatibleUnit { path, .. }
+            | Self::InvalidDatasetView { path, .. }
             | Self::InvalidUtf8 { path, .. } => Some(path),
             Self::EisSchemaConflict { details } => Some(&details.path),
             _ => None,

@@ -3,7 +3,7 @@
 use crate::{
     Column, ColumnDescriptor, ColumnMissingCount, ColumnRole, ConvertedValues, DatasetKind,
     DatasetSchema, Diagnostic, DiagnosticCode, DiagnosticSummary, Error, FormatId, Metadata,
-    Result, Unit, UnitConversion,
+    Result, Unit, UnitConversion, UnitErrorContext,
 };
 use polars::prelude::{Column as PolarsColumn, DataFrame};
 
@@ -173,6 +173,9 @@ impl Dataset {
                 path: self.metadata.provenance.path.clone().into(),
                 role: role.clone(),
                 column: Some(column_index + 1),
+                details: Box::new(UnitErrorContext {
+                    source_header: column.original_name.clone(),
+                }),
             });
         }
         let Some((scale, offset)) = conversion(&source_unit, &target_unit) else {
@@ -182,6 +185,9 @@ impl Dataset {
                 source_unit,
                 target_unit,
                 column: Some(column_index + 1),
+                details: Box::new(UnitErrorContext {
+                    source_header: column.original_name.clone(),
+                }),
             });
         };
         Ok(ConvertedValues {
@@ -228,9 +234,10 @@ impl Dataset {
     /// Constructs a role-based EIS view. Optional measured fields are never synthesized in storage.
     pub fn eis_view(&self) -> Result<EisView<'_>> {
         if self.kind() != DatasetKind::ImpedanceSpectrum {
-            return Err(Error::WrongDatasetKind {
-                expected: DatasetKind::ImpedanceSpectrum,
-                actual: self.kind(),
+            return Err(Error::InvalidDatasetView {
+                path: self.metadata.provenance.path.clone().into(),
+                requested_view: "EisView".into(),
+                dataset_kind: self.kind(),
             });
         }
         let frequency = self.required_column_in_unit(&ColumnRole::Frequency, Unit::Hertz)?;
@@ -447,6 +454,9 @@ impl Dataset {
                 path: self.metadata.provenance.path.clone().into(),
                 role: role.clone(),
                 column: Some(index + 1),
+                details: Box::new(UnitErrorContext {
+                    source_header: column.original_name.clone(),
+                }),
             });
         }
         if conversion(&source_unit, &unit) != Some((1.0, 0.0)) {
@@ -456,6 +466,9 @@ impl Dataset {
                 source_unit,
                 target_unit: unit,
                 column: Some(index + 1),
+                details: Box::new(UnitErrorContext {
+                    source_header: column.original_name.clone(),
+                }),
             });
         }
         Ok(Some(column))

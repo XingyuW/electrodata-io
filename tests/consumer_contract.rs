@@ -674,13 +674,110 @@ fn eis_view_rejects_missing_required_values_and_units() {
     )
     .unwrap();
     let dataset = read(wrong_unit.path()).unwrap();
+    match dataset.eis_view().unwrap_err() {
+        Error::IncompatibleUnit {
+            path,
+            role,
+            source_unit,
+            target_unit,
+            column,
+            details,
+        } => {
+            assert_eq!(path, wrong_unit.path());
+            assert_eq!(role, ColumnRole::ImpedanceReal);
+            assert_eq!(source_unit, Unit::Volt);
+            assert_eq!(target_unit, Unit::Ohm);
+            assert_eq!(column, Some(2));
+            assert_eq!(details.source_header.as_deref(), Some("Z'/V"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    let wrong_frequency_unit = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        wrong_frequency_unit.path(),
+        "Freq/V,Z'/ohm,Z\"/ohm\n1000,10,-1\n100,15,-5\n10,20,-10\n",
+    )
+    .unwrap();
+    let dataset = read(wrong_frequency_unit.path()).unwrap();
     assert!(matches!(
         dataset.eis_view(),
         Err(Error::IncompatibleUnit {
-            role: ColumnRole::ImpedanceReal,
+            role: ColumnRole::Frequency,
+            source_unit: Unit::Volt,
+            target_unit: Unit::Hertz,
+            column: Some(1),
             ..
         })
     ));
+}
+
+#[test]
+fn eis_view_rejects_non_eis_datasets_with_view_context() {
+    let path = fixture("regular_two_column.csv");
+    let dataset = read(&path).unwrap();
+
+    match dataset.eis_view().unwrap_err() {
+        Error::InvalidDatasetView {
+            path: error_path,
+            requested_view,
+            dataset_kind,
+        } => {
+            assert_eq!(error_path, path);
+            assert_eq!(requested_view, "EisView");
+            assert_eq!(dataset_kind, DatasetKind::TimeSeries);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn strict_eis_data_errors_retain_parser_context() {
+    let malformed = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        malformed.path(),
+        "Freq/Hz,Z'/ohm,Z\"/ohm\n1000,10,-1\n100,not-a-number,-5\n10,20,-10\n",
+    )
+    .unwrap();
+    match read(malformed.path()).unwrap_err() {
+        Error::MalformedNumeric {
+            path,
+            format_candidate,
+            row,
+            column,
+            value,
+            source,
+            ..
+        } => {
+            assert_eq!(path, malformed.path());
+            assert_eq!(format_candidate, Some(FormatId::ChiEis));
+            assert_eq!((row, column, value.as_str()), (3, 2, "not-a-number"));
+            assert!(source.is_some());
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    let ragged = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        ragged.path(),
+        "Freq/Hz,Z'/ohm,Z\"/ohm\n1000,10,-1\n100,15\n10,20,-10\n",
+    )
+    .unwrap();
+    match read(ragged.path()).unwrap_err() {
+        Error::RaggedRow {
+            path,
+            format_candidate,
+            row,
+            expected,
+            actual,
+            ..
+        } => {
+            assert_eq!(path, ragged.path());
+            assert_eq!(format_candidate, Some(FormatId::ChiEis));
+            assert_eq!((row, expected, actual), (3, 3, 2));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]
@@ -849,6 +946,44 @@ fn eis_missing_frequency_reaches_required_role_validation() {
             ..
         })
     ));
+}
+
+#[test]
+fn explicit_incomplete_eis_reaches_structured_required_role_validation() {
+    let file = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        file.path(),
+        "A.C. Impedance\n\nFreq/Hz,Z/ohm,Phase/deg\n1000,10.05,-5\n100,15.81,-18\n10,22.36,-27\n",
+    )
+    .unwrap();
+
+    let error = read(file.path()).unwrap_err();
+    match error {
+        Error::MissingRequiredRole {
+            path,
+            format_candidate,
+            role,
+            detected_roles,
+            diagnostics,
+        } => {
+            assert_eq!(path, file.path());
+            assert_eq!(format_candidate, FormatId::ChiEis);
+            assert_eq!(role, ColumnRole::ImpedanceReal);
+            assert_eq!(
+                detected_roles,
+                [
+                    ColumnRole::Frequency,
+                    ColumnRole::ImpedanceMagnitude,
+                    ColumnRole::ImpedancePhase,
+                ]
+            );
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, DiagnosticCode::EisSchema);
+            assert_eq!(diagnostics[0].row, Some(3));
+            assert_eq!(diagnostics[0].format_candidate, Some(FormatId::ChiEis));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]
