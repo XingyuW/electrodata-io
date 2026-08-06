@@ -1,6 +1,6 @@
 use electrodata_io::{
     ColumnRole, DatasetKind, DiagnosticCode, Error, FormatId, ReadOptions, Severity, Unit, read,
-    read_with_options,
+    read_chi_eis, read_with_options,
 };
 use std::error::Error as StdError;
 use std::path::Path;
@@ -100,6 +100,64 @@ fn public_reads_preserve_two_column_missing_imaginary_impedance_fields() {
             &[ColumnRole::Frequency, ColumnRole::ImpedanceReal],
         );
     }
+}
+
+#[test]
+fn forced_eis_two_column_headers_reach_required_role_validation() {
+    let cases = [
+        (
+            "Freq/Hz,Z'/ohm\n1,100\n10,80\n",
+            ColumnRole::ImpedanceImaginary,
+            vec![ColumnRole::Frequency, ColumnRole::ImpedanceReal],
+        ),
+        (
+            "Freq/Hz,Z\"/ohm\n1,-20\n10,-10\n",
+            ColumnRole::ImpedanceReal,
+            vec![ColumnRole::Frequency, ColumnRole::ImpedanceImaginary],
+        ),
+        (
+            "Z'/ohm,Z\"/ohm\n100,-20\n80,-10\n",
+            ColumnRole::Frequency,
+            vec![ColumnRole::ImpedanceReal, ColumnRole::ImpedanceImaginary],
+        ),
+    ];
+
+    for (contents, missing_role, detected_roles) in cases {
+        let file = temporary_csv(contents);
+        let error = read_chi_eis(file.path()).unwrap_err();
+        assert_missing_required_role(error, file.path(), missing_role, &detected_roles);
+    }
+}
+
+#[test]
+fn incomplete_two_column_eis_headers_remain_non_eis_automatically() {
+    for contents in [
+        "Freq/Hz,Z'/ohm\n1,100\n10,80\n",
+        "Freq/Hz,Z\"/ohm\n1,-20\n10,-10\n",
+        "Z'/ohm,Z\"/ohm\n100,-20\n80,-10\n",
+    ] {
+        let file = temporary_csv(contents);
+        assert_ne!(
+            electrodata_io::detect_format(file.path()).unwrap().format,
+            electrodata_io::ElectroDataFormat::ChiEis
+        );
+        assert_ne!(
+            read(file.path()).unwrap().kind(),
+            DatasetKind::ImpedanceSpectrum
+        );
+    }
+}
+
+#[test]
+fn complete_header_only_eis_remains_valid_without_a_chi_preamble() {
+    let file = temporary_csv("Freq/Hz,Z'/ohm,Z\"/ohm\n1,100,-20\n10,80,-10\n");
+
+    let dataset = read(file.path()).unwrap();
+    assert_eq!(dataset.kind(), DatasetKind::ImpedanceSpectrum);
+    assert_eq!(
+        dataset.eis_view().unwrap().frequency.values,
+        [Some(1.0), Some(10.0)]
+    );
 }
 
 #[test]
