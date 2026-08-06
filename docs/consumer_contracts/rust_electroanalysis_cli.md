@@ -248,10 +248,11 @@ Requirements:
 - CHI metadata preamble, instrument model, technique, parameters, and raw rows
   remain available.
 
-The current built-in reader recognizes only fixed-order five-column CHI EIS;
-the project handler recognizes fixed-order three/four-column compact EIS, while
-the current `EISData` conversion still requires phase. Reordered and three-column
-inputs are therefore migration gaps captured by the fixtures.
+The current built-in reader recognizes three-, four-, and five-column EIS tables
+by semantic headers in any source order, with magnitude and phase optional. It
+also detects header-only EIS signatures below explicit CHI-preamble confidence.
+Duplicate, ambiguous, and missing required roles are rejected with structured
+schema context; raw optional measured columns remain unmodified.
 
 ## 10. Required multichannel time-series behavior
 

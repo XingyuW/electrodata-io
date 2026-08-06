@@ -82,21 +82,8 @@ impl FormatHandler for RegularXyHandler {
             HeaderPolicy::Present => true,
             HeaderPolicy::Absent => false,
         };
-        if has_header {
-            let roles: Vec<ColumnRole> = first.iter().map(|cell| header_role(cell)).collect();
-            if roles.contains(&ColumnRole::Frequency)
-                && roles.iter().any(|role| {
-                    matches!(
-                        role,
-                        ColumnRole::ImpedanceReal
-                            | ColumnRole::ImpedanceImaginary
-                            | ColumnRole::ImpedanceMagnitude
-                            | ColumnRole::ImpedancePhase
-                    )
-                })
-            {
-                return None;
-            }
+        if has_header && eis_schema_candidate(first) {
+            return None;
         }
         let width = first.len();
         let data_position = usize::from(has_header);
@@ -211,6 +198,9 @@ impl FormatHandler for RegularXyHandler {
 }
 
 pub(crate) fn header_role(value: &str) -> ColumnRole {
+    if let [role] = eis_header_candidates(value).as_slice() {
+        return role.clone();
+    }
     let normalized = normalize_for_match(value);
     let compact: String = normalized
         .chars()
@@ -222,16 +212,6 @@ pub(crate) fn header_role(value: &str) -> ColumnRole {
         .unwrap_or(&compact);
     if matches!(stem, "time" | "timestamp") || stem.starts_with("time(") {
         ColumnRole::Time
-    } else if matches!(stem, "freq" | "frequency") {
-        ColumnRole::Frequency
-    } else if matches!(stem, "z'" | "zreal" | "re(z)" | "realz") {
-        ColumnRole::ImpedanceReal
-    } else if matches!(stem, "z\"" | "z''" | "zimag" | "im(z)" | "imaginaryz") {
-        ColumnRole::ImpedanceImaginary
-    } else if matches!(stem, "z" | "|z|" | "magnitude" | "zmod") {
-        ColumnRole::ImpedanceMagnitude
-    } else if matches!(stem, "phase" | "theta" | "φ") {
-        ColumnRole::ImpedancePhase
     } else if matches!(stem, "potential" | "voltage" | "ewe" | "e") {
         ColumnRole::Potential
     } else if matches!(stem, "current" | "i") {
@@ -245,6 +225,62 @@ pub(crate) fn header_role(value: &str) -> ColumnRole {
     } else {
         ColumnRole::Unknown
     }
+}
+
+/// Exact scientific EIS header meanings recognized without positional inference.
+/// A multi-role result is deliberately retained for structured EIS schema errors.
+pub(crate) fn eis_header_candidates(value: &str) -> Vec<ColumnRole> {
+    let normalized = normalize_for_match(value);
+    let semantic = normalized
+        .split_once('/')
+        .map(|(stem, _)| stem)
+        .unwrap_or(&normalized)
+        .trim();
+    if semantic.contains('+') {
+        return semantic.split('+').filter_map(eis_role_alias).collect();
+    }
+    eis_role_alias(semantic).into_iter().collect()
+}
+
+fn eis_role_alias(value: &str) -> Option<ColumnRole> {
+    let compact: String = value
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    match compact.as_str() {
+        "freq" | "frequency" => Some(ColumnRole::Frequency),
+        "z'" | "zreal" | "zre" | "re(z)" | "realz" | "realimpedance" => {
+            Some(ColumnRole::ImpedanceReal)
+        }
+        "z\"" | "z''" | "zim" | "zimag" | "zimaginary" | "im(z)" | "imaginaryz"
+        | "imaginaryimpedance" => Some(ColumnRole::ImpedanceImaginary),
+        "z" | "|z|" | "magnitude" | "zmod" | "impedancemagnitude" => {
+            Some(ColumnRole::ImpedanceMagnitude)
+        }
+        "phase" | "phaseangle" | "theta" | "φ" => Some(ColumnRole::ImpedancePhase),
+        _ => None,
+    }
+}
+
+/// True when a header has enough independent EIS-role evidence to warrant EIS
+/// schema validation, including an incomplete schema that must report an error.
+pub(crate) fn eis_schema_candidate(row: &[String]) -> bool {
+    if row.len() < 3 {
+        return false;
+    }
+    let candidates: Vec<ColumnRole> = row
+        .iter()
+        .flat_map(|value| eis_header_candidates(value))
+        .collect();
+    [
+        ColumnRole::Frequency,
+        ColumnRole::ImpedanceReal,
+        ColumnRole::ImpedanceImaginary,
+    ]
+    .iter()
+    .filter(|role| candidates.contains(role))
+    .count()
+        >= 2
 }
 
 pub(crate) fn measurement_channel(stem: &str) -> Option<u32> {

@@ -39,6 +39,19 @@ pub struct ErrorContext<'a> {
     pub diagnostics: &'a [Diagnostic],
 }
 
+/// Structured EIS header-schema failure retained by [`Error::EisSchemaConflict`].
+#[derive(Debug, Clone)]
+pub struct EisSchemaError {
+    pub path: PathBuf,
+    pub format_candidate: FormatId,
+    pub row: usize,
+    pub column: usize,
+    pub header: String,
+    pub candidate_roles: Vec<crate::ColumnRole>,
+    pub conflicting_role: Option<crate::ColumnRole>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
 /// Structured read failure.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -160,6 +173,8 @@ pub enum Error {
         role: crate::ColumnRole,
         diagnostics: Vec<Diagnostic>,
     },
+    #[error("EIS schema conflict: {details:?}")]
+    EisSchemaConflict { details: Box<EisSchemaError> },
     #[error("duplicate {role:?} coordinate at source row {row}")]
     DuplicateCoordinate {
         path: PathBuf,
@@ -293,6 +308,7 @@ impl Error {
             | Self::InvalidColumnSignature(_)
             | Self::InvalidColumnCount { .. }
             | Self::MissingRequiredRole { .. }
+            | Self::EisSchemaConflict { .. }
             | Self::EmptyData => ErrorCategory::Schema,
             Self::MalformedNumeric { .. } => ErrorCategory::MalformedNumeric,
             Self::RaggedRow { .. } => ErrorCategory::RaggedRow,
@@ -340,6 +356,7 @@ impl Error {
             | Self::UnknownUnit { path, .. }
             | Self::IncompatibleUnit { path, .. }
             | Self::InvalidUtf8 { path, .. } => Some(path),
+            Self::EisSchemaConflict { details } => Some(&details.path),
             _ => None,
         }
     }
@@ -380,6 +397,7 @@ impl Error {
             Self::MissingRequiredRole {
                 format_candidate, ..
             } => Some(format_candidate),
+            Self::EisSchemaConflict { details } => Some(&details.format_candidate),
             _ => None,
         }
     }
@@ -409,6 +427,7 @@ impl Error {
             | Self::Metadata { row, .. }
             | Self::DelimitedText { row, .. } => Some(*row),
             Self::MissingValue { source_row, .. } => *source_row,
+            Self::EisSchemaConflict { details } => Some(details.row),
             _ => None,
         }
     }
@@ -425,6 +444,7 @@ impl Error {
             Self::MissingValue { column, .. }
             | Self::UnknownUnit { column, .. }
             | Self::IncompatibleUnit { column, .. } => *column,
+            Self::EisSchemaConflict { details } => Some(details.column),
             _ => None,
         }
     }
@@ -452,6 +472,7 @@ impl Error {
             | Self::MissingRequiredRole { diagnostics, .. }
             | Self::DuplicateCoordinate { diagnostics, .. }
             | Self::NonMonotonicCoordinate { diagnostics, .. } => diagnostics,
+            Self::EisSchemaConflict { details } => &details.diagnostics,
             Self::UnusableFormula { diagnostics, .. } => diagnostics,
             _ => &[],
         }

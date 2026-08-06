@@ -1,6 +1,6 @@
 //! Structured non-fatal validation and recovery reports.
 
-use crate::{FormatId, ReadProfile};
+use crate::{ColumnRole, FormatId, ReadProfile};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -63,6 +63,7 @@ pub enum DiagnosticCode {
     MagnitudeMismatch,
     PhaseMismatch,
     UnusableFormula,
+    EisSchema,
 }
 
 impl PartialEq for DiagnosticCode {
@@ -110,6 +111,10 @@ pub struct Diagnostic {
     pub format_candidate: Option<FormatId>,
     /// Active read profile.
     pub profile: ReadProfile,
+    /// Exact EIS roles recognized from this header, if EIS schema resolution was attempted.
+    pub candidate_roles: Vec<ColumnRole>,
+    /// Explicit schema resolution or rejection decision, when applicable.
+    pub resolution: Option<String>,
 }
 
 impl Diagnostic {
@@ -131,6 +136,8 @@ impl Diagnostic {
             worksheet: None,
             format_candidate: None,
             profile: ReadProfile::Strict,
+            candidate_roles: Vec::new(),
+            resolution: None,
         }
     }
 
@@ -152,6 +159,16 @@ impl Diagnostic {
 
     pub(crate) fn with_token(mut self, token: &str) -> Self {
         self.token = Some(token.chars().take(128).collect());
+        self
+    }
+
+    pub(crate) fn with_candidate_roles(mut self, candidate_roles: Vec<ColumnRole>) -> Self {
+        self.candidate_roles = candidate_roles;
+        self
+    }
+
+    pub(crate) fn with_resolution(mut self, resolution: impl Into<String>) -> Self {
+        self.resolution = Some(resolution.into());
         self
     }
 

@@ -1,7 +1,11 @@
-use super::regular_xy::{header_role, header_unit};
+use super::regular_xy::{eis_header_candidates, eis_schema_candidate, header_unit};
 use super::{DetectedLayout, Detection, FormatHandler, FormatId, trim_cell};
 use crate::detection::normalize_for_match;
-use crate::{ColumnDescriptor, ColumnRole, Error, Probe, ReadOptions, Unit};
+use crate::{
+    ColumnDescriptor, ColumnRole, Diagnostic, DiagnosticCode, EisSchemaError, Error, Probe,
+    ReadOptions, Severity, Unit,
+};
+use std::path::Path;
 
 pub(crate) struct ChiOcptHandler;
 pub(crate) struct ChiMultichannelOcptHandler;
@@ -208,44 +212,123 @@ impl FormatHandler for ChiMultichannelOcptHandler {
     }
 }
 
-fn eis_roles(row: &[String]) -> bool {
-    if !(3..=5).contains(&row.len()) {
-        return false;
-    }
-    let roles: Vec<ColumnRole> = row.iter().map(|value| header_role(value)).collect();
-    let allowed = roles.iter().all(|role| {
-        matches!(
-            role,
-            ColumnRole::Frequency
-                | ColumnRole::ImpedanceReal
-                | ColumnRole::ImpedanceImaginary
-                | ColumnRole::ImpedanceMagnitude
-                | ColumnRole::ImpedancePhase
+pub(crate) fn validate_eis_schema(
+    path: &Path,
+    probe: &Probe,
+    detection: &Detection,
+    options: &ReadOptions,
+) -> crate::Result<()> {
+    let header_index = detection.layout.header_row.ok_or(Error::HeaderNotFound)?;
+    let header = probe.row(header_index).ok_or(Error::HeaderNotFound)?;
+    let format_candidate = detection.format.clone();
+    let context = |diagnostic: Diagnostic| {
+        diagnostic.with_context(
+            path,
+            probe.worksheet_name.as_deref(),
+            &format_candidate,
+            options.effective_profile(),
         )
-    });
-    allowed
-        && unique_role(&roles, &ColumnRole::Frequency)
-        && roles.iter().any(|role| {
-            matches!(
-                role,
-                ColumnRole::ImpedanceReal
-                    | ColumnRole::ImpedanceImaginary
-                    | ColumnRole::ImpedanceMagnitude
-                    | ColumnRole::ImpedancePhase
-            )
-        })
-        && [
-            ColumnRole::ImpedanceReal,
-            ColumnRole::ImpedanceImaginary,
-            ColumnRole::ImpedanceMagnitude,
-            ColumnRole::ImpedancePhase,
-        ]
-        .iter()
-        .all(|expected| roles.iter().filter(|role| *role == expected).count() <= 1)
-}
+    };
 
-fn unique_role(roles: &[ColumnRole], expected: &ColumnRole) -> bool {
-    roles.iter().filter(|role| *role == expected).count() == 1
+    let mut resolved = Vec::with_capacity(header.len());
+    for (index, source) in header.iter().enumerate() {
+        let candidates = eis_header_candidates(source);
+        if candidates.len() > 1 {
+            let diagnostic = context(
+                Diagnostic::new(
+                    Severity::Error,
+                    DiagnosticCode::EisSchema,
+                    "EIS header matches incompatible scientific roles; no positional resolution was applied",
+                )
+                .at(header_index + 1, Some(index + 1))
+                .for_column(trim_cell(source))
+                .with_candidate_roles(candidates.clone())
+                .with_resolution("rejected: ambiguous EIS header"),
+            );
+            return Err(Error::EisSchemaConflict {
+                details: Box::new(EisSchemaError {
+                    path: path.to_path_buf(),
+                    format_candidate,
+                    row: header_index + 1,
+                    column: index + 1,
+                    header: trim_cell(source).to_owned(),
+                    candidate_roles: candidates,
+                    conflicting_role: None,
+                    diagnostics: vec![diagnostic],
+                }),
+            });
+        }
+        resolved.push(candidates.into_iter().next());
+    }
+
+    for role in [
+        ColumnRole::Frequency,
+        ColumnRole::ImpedanceReal,
+        ColumnRole::ImpedanceImaginary,
+        ColumnRole::ImpedanceMagnitude,
+        ColumnRole::ImpedancePhase,
+    ] {
+        let matches: Vec<usize> = resolved
+            .iter()
+            .enumerate()
+            .filter_map(|(index, candidate)| (candidate.as_ref() == Some(&role)).then_some(index))
+            .collect();
+        if matches.len() > 1 {
+            let index = matches[1];
+            let diagnostic = context(
+                Diagnostic::new(
+                    Severity::Error,
+                    DiagnosticCode::EisSchema,
+                    "EIS role occurs in multiple source columns; no first-column fallback was applied",
+                )
+                .at(header_index + 1, Some(index + 1))
+                .for_column(trim_cell(&header[index]))
+                .with_candidate_roles(vec![role.clone()])
+                .with_resolution("rejected: duplicate EIS role"),
+            );
+            return Err(Error::EisSchemaConflict {
+                details: Box::new(EisSchemaError {
+                    path: path.to_path_buf(),
+                    format_candidate,
+                    row: header_index + 1,
+                    column: index + 1,
+                    header: trim_cell(&header[index]).to_owned(),
+                    candidate_roles: vec![role.clone()],
+                    conflicting_role: Some(role),
+                    diagnostics: vec![diagnostic],
+                }),
+            });
+        }
+    }
+
+    for role in [
+        ColumnRole::Frequency,
+        ColumnRole::ImpedanceReal,
+        ColumnRole::ImpedanceImaginary,
+    ] {
+        if !resolved
+            .iter()
+            .any(|candidate| candidate.as_ref() == Some(&role))
+        {
+            let diagnostic = context(
+                Diagnostic::new(
+                    Severity::Error,
+                    DiagnosticCode::EisSchema,
+                    format!("required EIS role {role:?} is absent from the source header"),
+                )
+                .at(header_index + 1, None)
+                .with_candidate_roles(Vec::new())
+                .with_resolution("rejected: missing required EIS role"),
+            );
+            return Err(Error::MissingRequiredRole {
+                path: path.to_path_buf(),
+                format_candidate,
+                role,
+                diagnostics: vec![diagnostic],
+            });
+        }
+    }
+    Ok(())
 }
 
 impl FormatHandler for ChiEisHandler {
@@ -254,17 +337,26 @@ impl FormatHandler for ChiEisHandler {
     }
     fn detect(&self, probe: &Probe, _options: &ReadOptions) -> Option<Detection> {
         let technique = technique_row(probe, eis_technique).map(|(_, technique)| technique);
-        let (header, data) = header_and_data(probe, eis_roles)?;
+        let (header, data) = header_and_data(probe, eis_schema_candidate)?;
         let header_row = probe.row(header)?;
         let width = header_row.len();
-        let roles: Vec<_> = header_row.iter().map(|value| header_role(value)).collect();
+        let roles: Vec<_> = header_row
+            .iter()
+            .map(|value| eis_header_candidates(value))
+            .collect();
         let complete = [
             ColumnRole::Frequency,
             ColumnRole::ImpedanceReal,
             ColumnRole::ImpedanceImaginary,
         ]
         .iter()
-        .all(|role| unique_role(&roles, role));
+        .all(|role| {
+            roles
+                .iter()
+                .filter(|candidates| candidates.as_slice() == [role.clone()])
+                .count()
+                == 1
+        });
         Some(Detection {
             format: FormatId::ChiEis,
             confidence: match (technique.as_deref(), complete) {
@@ -304,13 +396,17 @@ impl FormatHandler for ChiEisHandler {
             .ok_or(Error::HeaderNotFound)?;
         row.iter()
             .map(|source| {
-                let role = header_role(source);
+                let role = eis_header_candidates(source)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(ColumnRole::Unknown);
                 let stem = match role {
                     ColumnRole::Frequency => "frequency",
                     ColumnRole::ImpedanceReal => "z_real",
                     ColumnRole::ImpedanceImaginary => "z_imag",
                     ColumnRole::ImpedanceMagnitude => "z_magnitude",
                     ColumnRole::ImpedancePhase => "phase",
+                    ColumnRole::Unknown => "column",
                     _ => return Err(Error::InvalidColumnSignature(source.clone())),
                 };
                 let unit = header_unit(source).unwrap_or(Unit::Unknown);

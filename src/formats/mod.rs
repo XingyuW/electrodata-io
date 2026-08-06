@@ -9,7 +9,9 @@ use std::fmt;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-pub(crate) use chi::{ChiEisHandler, ChiMultichannelOcptHandler, ChiOcptHandler};
+pub(crate) use chi::{
+    ChiEisHandler, ChiMultichannelOcptHandler, ChiOcptHandler, validate_eis_schema,
+};
 pub(crate) use regular_xy::{
     FirstRowClassification, RegularXyHandler, classify_first_row, explicit_comment_row,
 };

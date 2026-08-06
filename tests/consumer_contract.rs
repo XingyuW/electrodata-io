@@ -280,6 +280,7 @@ fn diagnostic_code_name(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::MagnitudeMismatch => "MagnitudeMismatch",
         DiagnosticCode::PhaseMismatch => "PhaseMismatch",
         DiagnosticCode::UnusableFormula => "UnusableFormula",
+        DiagnosticCode::EisSchema => "EisSchema",
     }
 }
 
@@ -830,6 +831,279 @@ fn eis_missing_required_role_is_structured() {
             ..
         }
     ));
+}
+
+#[test]
+fn eis_missing_frequency_reaches_required_role_validation() {
+    let file = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        file.path(),
+        "Z'/ohm,Z\"/ohm,Z/ohm\n10,-1,10.05\n15,-5,15.81\n20,-10,22.36\n",
+    )
+    .unwrap();
+
+    assert!(matches!(
+        read(file.path()),
+        Err(Error::MissingRequiredRole {
+            role: ColumnRole::Frequency,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn eis_missing_real_and_duplicate_frequency_are_structured_schema_errors() {
+    let missing_real = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        missing_real.path(),
+        "Freq/Hz,Z\"/ohm,Z/ohm\n1000,-1,10.05\n100,-5,15.81\n10,-10,22.36\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        read(missing_real.path()),
+        Err(Error::MissingRequiredRole {
+            role: ColumnRole::ImpedanceReal,
+            ..
+        })
+    ));
+
+    let duplicate_frequency = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        duplicate_frequency.path(),
+        "Freq/Hz,Frequency/Hz,Z'/ohm\n1000,1000,10\n100,100,15\n10,10,20\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        read(duplicate_frequency.path()),
+        Err(Error::EisSchemaConflict { details })
+            if details.conflicting_role == Some(ColumnRole::Frequency) && details.column == 2
+    ));
+}
+
+#[test]
+fn eis_duplicate_and_ambiguous_headers_have_schema_diagnostics() {
+    let duplicate = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        duplicate.path(),
+        "Freq/Hz,Z'/ohm,Z'/ohm\n1000,10,11\n100,15,16\n10,20,21\n",
+    )
+    .unwrap();
+    let error = read(duplicate.path()).unwrap_err();
+    let Error::EisSchemaConflict { details } = error else {
+        panic!("expected an EIS schema conflict");
+    };
+    let details = *details;
+    let electrodata_io::EisSchemaError {
+        row,
+        column,
+        header,
+        candidate_roles,
+        conflicting_role,
+        diagnostics,
+        ..
+    } = details;
+    assert_eq!((row, column, header.as_str()), (1, 3, "Z'/ohm"));
+    assert_eq!(candidate_roles, [ColumnRole::ImpedanceReal]);
+    assert_eq!(conflicting_role, Some(ColumnRole::ImpedanceReal));
+    assert_eq!(diagnostics[0].candidate_roles, candidate_roles);
+    assert_eq!(
+        diagnostics[0].resolution.as_deref(),
+        Some("rejected: duplicate EIS role")
+    );
+
+    let ambiguous = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        ambiguous.path(),
+        "Freq/Hz,\"Z' + Z\"\"\",Z/ohm\n1000,10,10.05\n100,15,15.81\n10,20,22.36\n",
+    )
+    .unwrap();
+    let error = read(ambiguous.path()).unwrap_err();
+    let Error::EisSchemaConflict { details } = error else {
+        panic!("expected an EIS schema conflict");
+    };
+    let details = *details;
+    let electrodata_io::EisSchemaError {
+        row,
+        column,
+        header,
+        candidate_roles,
+        conflicting_role,
+        diagnostics,
+        ..
+    } = details;
+    assert_eq!((row, column, header.as_str()), (1, 2, "Z' + Z\""));
+    assert_eq!(
+        candidate_roles,
+        [ColumnRole::ImpedanceReal, ColumnRole::ImpedanceImaginary]
+    );
+    assert_eq!(conflicting_role, None);
+    assert_eq!(diagnostics[0].candidate_roles, candidate_roles);
+    assert_eq!(
+        diagnostics[0].resolution.as_deref(),
+        Some("rejected: ambiguous EIS header")
+    );
+}
+
+#[test]
+fn eis_header_roles_are_semantic_optional_columns_remain_measured_and_unknowns_are_retained() {
+    let cases = [
+        (
+            "frequency/Hz,real impedance/ohm,imaginary impedance/ohm",
+            "1000,10,-1\n100,15,-5\n10,20,-10",
+            [0, 1, 2],
+            None,
+            None,
+        ),
+        (
+            "Zre/ohm,Zim/ohm,freq/Hz,magnitude/ohm",
+            "10,-1,1000,10.049876\n15,-5,100,15.811388\n20,-10,10,22.360680",
+            [2, 0, 1],
+            Some(3),
+            None,
+        ),
+        (
+            "Phase Angle/deg,Frequency/Hz,Z\"/ohm,Z'/ohm",
+            "-5.710593,1000,-1,10\n-18.434949,100,-5,15\n-26.565051,10,-10,20",
+            [1, 3, 2],
+            None,
+            Some(0),
+        ),
+        (
+            "|Z|/ohm,phase/deg,FREQ/Hz,Real Impedance/ohm,Imaginary Impedance/ohm",
+            "10.049876,-5.710593,1000,10,-1\n15.811388,-18.434949,100,15,-5\n22.360680,-26.565051,10,20,-10",
+            [2, 3, 4],
+            Some(0),
+            Some(1),
+        ),
+        (
+            "Zim/ohm,Zmod/ohm,Zre/ohm,frequency/Hz,Aux/count",
+            "-1,10.049876,10,1000,7\n-5,15.811388,15,100,8\n-10,22.360680,20,10,9",
+            [3, 2, 0],
+            Some(1),
+            None,
+        ),
+    ];
+    for (header, rows, required, magnitude, phase) in cases {
+        let file = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+        std::fs::write(file.path(), format!("{header}\n{rows}\n")).unwrap();
+        let dataset = read(file.path()).unwrap();
+        assert_eq!(dataset.kind(), DatasetKind::ImpedanceSpectrum, "{header}");
+        assert!(dataset.metadata.provenance.detection_confidence >= 0.93);
+        assert_eq!(dataset.canonical_columns().len(), header.split(',').count());
+        assert_eq!(
+            dataset
+                .canonical_columns()
+                .iter()
+                .map(|column| column.original_name.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            header.split(',').collect::<Vec<_>>(),
+            "original headers must remain source-preserved"
+        );
+        assert_eq!(
+            dataset.canonical_columns()[required[0]].role,
+            ColumnRole::Frequency
+        );
+        assert_eq!(
+            dataset.canonical_columns()[required[1]].role,
+            ColumnRole::ImpedanceReal
+        );
+        assert_eq!(
+            dataset.canonical_columns()[required[2]].role,
+            ColumnRole::ImpedanceImaginary
+        );
+        assert_eq!(
+            dataset.canonical_columns()[required[0]].unit,
+            Some(Unit::Hertz)
+        );
+        assert_eq!(
+            dataset.canonical_columns()[required[1]].unit,
+            Some(Unit::Ohm)
+        );
+        assert_eq!(
+            dataset.canonical_columns()[required[2]].unit,
+            Some(Unit::Ohm)
+        );
+        assert_eq!(
+            dataset.f64_values(&ColumnRole::Frequency).unwrap(),
+            &[Some(1000.0), Some(100.0), Some(10.0)]
+        );
+        assert_eq!(
+            dataset.f64_values(&ColumnRole::ImpedanceReal).unwrap(),
+            &[Some(10.0), Some(15.0), Some(20.0)]
+        );
+        assert_eq!(
+            dataset.f64_values(&ColumnRole::ImpedanceImaginary).unwrap(),
+            &[Some(-1.0), Some(-5.0), Some(-10.0)]
+        );
+        assert_eq!(
+            dataset
+                .columns_by_role(&ColumnRole::ImpedanceMagnitude)
+                .first()
+                .copied(),
+            magnitude
+        );
+        assert_eq!(
+            dataset
+                .columns_by_role(&ColumnRole::ImpedancePhase)
+                .first()
+                .copied(),
+            phase
+        );
+        assert!(dataset.diagnostics.is_empty());
+    }
+}
+
+#[test]
+fn eis_optional_missing_cells_preserve_alignment_and_non_eis_shapes_are_not_guessed() {
+    for (header, optional_role) in [
+        (
+            "Freq/Hz,Z'/ohm,Z\"/ohm,Z/ohm",
+            ColumnRole::ImpedanceMagnitude,
+        ),
+        (
+            "Freq/Hz,Z'/ohm,Z\"/ohm,Phase/deg",
+            ColumnRole::ImpedancePhase,
+        ),
+    ] {
+        let file = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            format!("{header}\n1000,10,-1,10\n100,15,-5,\n10,20,-10,20\n"),
+        )
+        .unwrap();
+        let dataset = read(file.path()).unwrap();
+        assert_eq!(dataset.canonical_columns().len(), 4);
+        assert_eq!(dataset.f64_values(&optional_role).unwrap()[1], None);
+        let view = dataset.eis_view().unwrap();
+        let values = if optional_role == ColumnRole::ImpedanceMagnitude {
+            view.magnitude_values()
+        } else {
+            view.phase_values()
+        };
+        assert_eq!(values[1], None, "measured null must not be derived");
+    }
+
+    let non_eis = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(
+        non_eis.path(),
+        "Frequency/Hz,Magnitude/ohm,Phase/deg\n1000,10,-5\n100,15,-10\n10,20,-15\n",
+    )
+    .unwrap();
+    assert_ne!(
+        detect_format(non_eis.path()).unwrap().format,
+        electrodata_io::ElectroDataFormat::ChiEis
+    );
+    assert_eq!(
+        read(non_eis.path()).unwrap().kind(),
+        DatasetKind::GenericTable
+    );
+
+    let headerless = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    std::fs::write(headerless.path(), "1000,10,-1\n100,15,-5\n10,20,-10\n").unwrap();
+    assert_ne!(
+        detect_format(headerless.path()).unwrap().format,
+        electrodata_io::ElectroDataFormat::ChiEis
+    );
 }
 
 #[test]

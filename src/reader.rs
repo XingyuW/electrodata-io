@@ -254,6 +254,9 @@ impl DataReader {
             source_sha256,
             formula_cells,
         } = source;
+        if detection.format == crate::FormatId::ChiEis {
+            crate::formats::validate_eis_schema(path, &probe, &detection, options)?;
+        }
         let descriptors = handler.columns(&probe, &detection).map_err(|error| {
             error.with_read_context(
                 path,
@@ -261,22 +264,6 @@ impl DataReader {
                 Some(detection.format.clone()),
             )
         })?;
-        if detection.format == crate::FormatId::ChiEis {
-            for role in [
-                ColumnRole::Frequency,
-                ColumnRole::ImpedanceReal,
-                ColumnRole::ImpedanceImaginary,
-            ] {
-                if !descriptors.iter().any(|descriptor| descriptor.role == role) {
-                    return Err(Error::MissingRequiredRole {
-                        path: path.to_path_buf(),
-                        format_candidate: detection.format.clone(),
-                        role,
-                        diagnostics: Vec::new(),
-                    });
-                }
-            }
-        }
         let mut diagnostics: Vec<Diagnostic> = source_diagnostics
             .into_iter()
             .map(|diagnostic| {
