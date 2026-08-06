@@ -363,7 +363,14 @@ impl FormatHandler for ChiEisHandler {
         // `validate_eis_schema` so callers receive the role-specific structured
         // schema error instead of an unstructured detection failure.
         let (header, data) = eis_header_and_data(probe, |row| {
-            eis_schema_candidate(row) || (technique.is_some() && row.len() >= 3)
+            let explicit_two_column_header = technique.is_some()
+                && row.len() == 2
+                && row
+                    .iter()
+                    .any(|value| !eis_header_candidates(value).is_empty());
+            eis_schema_candidate(row)
+                || (technique.is_some() && row.len() >= 3)
+                || explicit_two_column_header
         })?;
         let header_row = probe.row(header)?;
         let width = header_row.len();

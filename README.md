@@ -592,6 +592,40 @@ match read("input.csv") {
 }
 ```
 
+### Structured EIS failures
+
+Fatal EIS failures remain machine-readable through `read`, `read_with_options`,
+and `Dataset::eis_view()`. Callers can match these public variants:
+
+- `MissingRequiredRole` carries the path, `ChiEis` format candidate, absent
+  role, all detected roles, and source-located `EisSchema` diagnostics.
+- `EisSchemaConflict` carries an `EisSchemaError` with the path, format,
+  one-based header row and column, original header, candidate roles, optional
+  duplicate role, and rejection diagnostics.
+- `UnknownUnit` and `IncompatibleUnit` carry the path, required role, one-based
+  column, original source header, units, and expected target unit where
+  applicable.
+- `InvalidDatasetView` carries the path, requested view, and actual dataset
+  kind. `MissingValue` carries the required role plus dataset/source row and
+  source-column context.
+- Fatal row decoding remains typed as variants such as `MalformedNumeric` and
+  `RaggedRow`, including path, format, row, column, diagnostics, and an
+  underlying source error when one exists.
+
+Fatal errors return `Err(Error)` and prevent construction of an invalid EIS
+dataset. Recoverable conditions return a `Dataset` and remain in
+`Dataset::diagnostics` with a stable `DiagnosticCode`, location, severity, and
+recovery action; diagnostics are never substitutes for fatal schema errors.
+Structural EIS variants are terminal and normally have no `Error::source()`.
+Backend and parsing variants preserve their lower-level error through
+`std::error::Error::source()`.
+
+There is no public `Error` enum layout change for this correction. The only
+runtime compatibility change is for invalid files with an explicit EIS
+technique and a two-column EIS header: they now return
+`MissingRequiredRole` instead of a generic detection or column-signature
+failure. Valid EIS and regular-table parsing are unchanged.
+
 The library does not panic on malformed input. Strict UTF-8 decoding is the
 default; explicitly enabling lossy decoding adds a decoding diagnostic.
 
