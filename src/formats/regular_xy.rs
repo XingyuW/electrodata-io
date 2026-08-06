@@ -1,6 +1,8 @@
 use super::{DetectedLayout, Detection, FormatHandler, FormatId, numeric, trim_cell};
 use crate::detection::normalize_for_match;
-use crate::{ColumnDescriptor, ColumnRole, HeaderPolicy, Probe, ReadOptions, Unit};
+use crate::{
+    ColumnDescriptor, ColumnRole, ContainerFormat, HeaderPolicy, Probe, ReadOptions, Unit,
+};
 use std::collections::HashMap;
 
 /// Compatibility format id backed by the generalized N-column table handler.
@@ -62,6 +64,16 @@ impl FormatHandler for RegularXyHandler {
         }) {
             return None;
         }
+        // Workbooks often have free-form acquisition notes before the actual
+        // table. Search the bounded worksheet preview for a semantic time
+        // header with compatible numeric rows rather than assuming a row
+        // count. Delimited-text preambles retain their stricter, explicit
+        // comment syntax behavior.
+        let search_limit = if probe.container == ContainerFormat::Csv {
+            8
+        } else {
+            options.probe_rows
+        };
         let table_rows: Vec<(usize, &[String])> = probe
             .rows
             .iter()
@@ -70,9 +82,33 @@ impl FormatHandler for RegularXyHandler {
                 row.iter().any(|cell| !trim_cell(cell).is_empty()) && !explicit_comment_row(row)
             })
             .map(|(index, row)| (index, row.as_slice()))
-            .take(8)
+            .take(search_limit)
             .collect();
-        let (first_index, first) = *table_rows.first()?;
+        let first_candidate = if probe.container == ContainerFormat::Csv {
+            Some(0)
+        } else {
+            table_rows
+                .iter()
+                .position(|(_, row)| {
+                    row.len() >= 2
+                        && matches!(classify_first_row(row), FirstRowClassification::Header(_))
+                        && matches!(header_role(&row[0]), ColumnRole::Time)
+                        && numeric_rows_after(&table_rows, row, 1) > 0
+                })
+                // Preserve established header-at-first-row generic-table
+                // support. Preambles cannot take this path because they lack
+                // immediate shaped numeric evidence.
+                .or_else(|| {
+                    table_rows.first().and_then(|(index, row)| {
+                        (*index == 0
+                            && row.len() >= 2
+                            && matches!(classify_first_row(row), FirstRowClassification::Header(_))
+                            && numeric_rows_after(&table_rows, row, 1) > 0)
+                            .then_some(0)
+                    })
+                })
+        };
+        let (first_index, first) = *table_rows.get(first_candidate?)?;
         if first.len() < 2 {
             return None;
         }
@@ -89,6 +125,7 @@ impl FormatHandler for RegularXyHandler {
         let data_position = usize::from(has_header);
         let candidate_rows: Vec<&&[String]> = table_rows
             .iter()
+            .skip(first_candidate?)
             .skip(data_position)
             .take(5)
             .map(|(_, row)| row)
@@ -110,7 +147,7 @@ impl FormatHandler for RegularXyHandler {
         if candidate_rows.is_empty() || shaped_rows == 0 || numeric_rows == 0 {
             return None;
         }
-        let data_start_row = table_rows.get(data_position)?.0;
+        let data_start_row = table_rows.get(first_candidate? + data_position)?.0;
         let semantic_header = has_header
             && first
                 .iter()
@@ -132,12 +169,22 @@ impl FormatHandler for RegularXyHandler {
             },
             evidence: vec![
                 format!("{width} consistently shaped delimited columns"),
+                if first_index > 0 {
+                    format!(
+                        "semantic time header discovered after {first_index} worksheet preamble row(s)"
+                    )
+                } else {
+                    String::new()
+                },
                 if has_header {
                     "text header followed by numeric rows".into()
                 } else {
                     "first row is numeric data".into()
                 },
-            ],
+            ]
+            .into_iter()
+            .filter(|e| !e.is_empty())
+            .collect(),
             layout: DetectedLayout {
                 header_row: has_header.then_some(first_index),
                 data_start_row,
@@ -195,6 +242,27 @@ impl FormatHandler for RegularXyHandler {
             })
             .collect())
     }
+}
+
+fn numeric_rows_after(
+    table_rows: &[(usize, &[String])],
+    header: &[String],
+    minimum: usize,
+) -> usize {
+    table_rows
+        .iter()
+        .skip_while(|(_, row)| !std::ptr::eq(*row, header))
+        .skip(1)
+        .take(5)
+        .filter(|(_, row)| {
+            row.len() == header.len()
+                && row.iter().all(|cell| {
+                    let value = trim_cell(cell);
+                    value.is_empty() || missing_token(value) || numeric(value)
+                })
+        })
+        .take(minimum)
+        .count()
 }
 
 pub(crate) fn header_role(value: &str) -> ColumnRole {

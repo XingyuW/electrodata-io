@@ -31,11 +31,16 @@ pub struct Dataset {
 /// Borrowed view of an aligned time-series table.
 #[derive(Debug, Clone)]
 pub struct TimeSeriesView<'a> {
+    /// Source coordinate values, retained exactly as decoded from the input.
+    ///
+    /// This is a physical time coordinate only when [`Self::coordinate_unit`]
+    /// establishes a time unit. It is never implicitly interpreted as seconds.
     pub time: &'a Column,
-    /// Time values explicitly converted to seconds.
-    pub time_seconds: Vec<Option<f64>>,
-    /// Exact conversion applied to `time_seconds`.
-    pub time_conversion: UnitConversion,
+    /// Time values explicitly converted to seconds, when the source unit makes
+    /// that conversion justified.
+    pub time_seconds: Option<Vec<Option<f64>>>,
+    /// Exact conversion applied to `time_seconds`, when available.
+    pub time_conversion: Option<UnitConversion>,
     pub measurements: Vec<&'a Column>,
     pub source_rows: &'a [usize],
 }
@@ -218,6 +223,21 @@ impl Dataset {
             .values)
     }
 
+    /// Returns the original numeric time-coordinate values without unit conversion.
+    ///
+    /// Headerless inputs may infer the `Time` role while retaining an unknown
+    /// source unit. This accessor remains valid in that case.
+    pub fn coordinate_values(&self) -> Result<&[Option<f64>]> {
+        Ok(&self.canonical_column(&ColumnRole::Time)?.values)
+    }
+
+    /// Returns the source unit attached to the time coordinate, if present.
+    ///
+    /// Built-in readers represent an absent source unit as `Some(Unit::Unknown)`.
+    pub fn coordinate_unit(&self) -> Result<Option<&Unit>> {
+        Ok(self.canonical_column(&ColumnRole::Time)?.unit.as_ref())
+    }
+
     /// Constructs a typed time-series view.
     pub fn time_series_view(&self) -> Result<TimeSeriesView<'_>> {
         self.with_provenance_context((|| {
@@ -227,11 +247,17 @@ impl Dataset {
                     actual: self.kind(),
                 });
             }
-            let converted = self.converted_f64_values(&ColumnRole::Time, Unit::Second)?;
+            let time = self.canonical_column(&ColumnRole::Time)?;
+            let normalized =
+                matches!(time.unit, Some(ref unit) if conversion(unit, &Unit::Second).is_some())
+                    .then(|| self.converted_f64_values(&ColumnRole::Time, Unit::Second))
+                    .transpose()?;
             Ok(TimeSeriesView {
-                time: self.canonical_column(&ColumnRole::Time)?,
-                time_seconds: converted.values,
-                time_conversion: converted.conversion,
+                time,
+                time_seconds: normalized
+                    .as_ref()
+                    .map(|converted| converted.values.clone()),
+                time_conversion: normalized.map(|converted| converted.conversion),
                 measurements: self.measurement_channels(),
                 source_rows: &self.source_rows,
             })
@@ -496,6 +522,25 @@ impl Dataset {
                 Some(self.format.clone()),
             )
         })
+    }
+}
+
+impl TimeSeriesView<'_> {
+    /// Returns source coordinate values without physical-unit normalization.
+    pub fn coordinate_values(&self) -> &[Option<f64>] {
+        &self.time.values
+    }
+
+    /// Returns the source unit of the coordinate, including `Unit::Unknown`.
+    pub fn coordinate_unit(&self) -> Option<&Unit> {
+        self.time.unit.as_ref()
+    }
+
+    /// Returns normalized seconds only when the source coordinate has a
+    /// recognized time unit. Use [`Dataset::time_seconds`] when an unavailable
+    /// normalization must produce a structured error.
+    pub fn normalized_seconds(&self) -> Option<&[Option<f64>]> {
+        self.time_seconds.as_deref()
     }
 }
 

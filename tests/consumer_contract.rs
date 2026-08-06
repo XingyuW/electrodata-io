@@ -363,6 +363,23 @@ fn headerless_tables_require_explicit_compatibility_and_retain_all_rows() {
     std::fs::write(wide.path(), "0,1,2,3\n1,4,,6\n2,7,8,9\n").unwrap();
     let dataset = read_with_options(wide.path(), &compatibility()).unwrap();
     assert_eq!(dataset.canonical_columns().len(), 4);
+    assert_eq!(dataset.source_row(0), Some(1));
+    assert_eq!(
+        dataset.coordinate_values().unwrap(),
+        [Some(0.0), Some(1.0), Some(2.0)]
+    );
+    assert_eq!(dataset.coordinate_unit().unwrap(), Some(&Unit::Unknown));
+    assert!(matches!(
+        dataset.time_seconds(),
+        Err(Error::UnknownUnit {
+            role: ColumnRole::Time,
+            ..
+        })
+    ));
+    assert_eq!(
+        dataset.time_series_view().unwrap().coordinate_values(),
+        [Some(0.0), Some(1.0), Some(2.0)]
+    );
     assert_eq!(dataset.canonical_columns()[2].values[1], None);
     assert_eq!(dataset.measurement_channels().len(), 3);
 }
@@ -624,17 +641,26 @@ fn typed_time_access_is_unit_checked_and_converted() {
         [Some(0.0), Some(1_800.0), Some(3_600.0)]
     );
     let view = dataset.time_series_view().unwrap();
-    assert_eq!(view.time_conversion.source_unit, Unit::Hour);
-    assert_eq!(view.time_conversion.target_unit, Unit::Second);
-    assert_eq!(view.time_conversion.scale, 3_600.0);
+    let conversion = view.time_conversion.as_ref().unwrap();
+    assert_eq!(conversion.source_unit, Unit::Hour);
+    assert_eq!(conversion.target_unit, Unit::Second);
+    assert_eq!(conversion.scale, 3_600.0);
+    assert_eq!(
+        view.normalized_seconds().unwrap(),
+        [Some(0.0), Some(1_800.0), Some(3_600.0)]
+    );
 
     let headerless = read_with_options(
         fixture("regular_headerless.csv"),
         &ReadOptions::compatibility(),
     )
     .unwrap();
+    let view = headerless.time_series_view().unwrap();
+    assert_eq!(view.coordinate_values(), [Some(0.0), Some(1.0), Some(2.0)]);
+    assert_eq!(view.coordinate_unit(), Some(&Unit::Unknown));
+    assert!(view.normalized_seconds().is_none());
     assert!(matches!(
-        headerless.time_series_view(),
+        headerless.time_seconds(),
         Err(Error::UnknownUnit {
             role: ColumnRole::Time,
             ..
@@ -644,8 +670,15 @@ fn typed_time_access_is_unit_checked_and_converted() {
     let incompatible = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
     std::fs::write(incompatible.path(), "Time/V,Potential/V\n0,1\n1,2\n2,3\n").unwrap();
     let dataset = read(incompatible.path()).unwrap();
+    assert!(
+        dataset
+            .time_series_view()
+            .unwrap()
+            .normalized_seconds()
+            .is_none()
+    );
     assert!(matches!(
-        dataset.time_series_view(),
+        dataset.time_seconds(),
         Err(Error::IncompatibleUnit {
             role: ColumnRole::Time,
             ..

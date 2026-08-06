@@ -14,7 +14,7 @@ interpolates, corrects units, or replaces measured values with derived values.
 ## Basic use
 
 ```rust,no_run
-use electrodata_io::{ColumnRole, read};
+use electrodata_io::read;
 
 let dataset = read("experiment.csv")?;
 println!("kind={:?}", dataset.kind());
@@ -53,12 +53,28 @@ physical values:
 use electrodata_io::{ColumnRole, read};
 
 let dataset = read("experiment.csv")?;
-let time = dataset.f64_values(&ColumnRole::Time)?;
 let view = dataset.time_series_view()?;
-println!("{} samples, {} measurements", time.len(), view.measurements.len());
-println!("time in seconds: {:?}", view.time_seconds);
+println!("{} samples, {} measurements", view.coordinate_values().len(), view.measurements.len());
+println!("source coordinate: {:?}", view.coordinate_values());
+println!("normalized seconds: {:?}", view.normalized_seconds());
 # Ok::<(), electrodata_io::Error>(())
 ```
+
+### Time coordinates and units
+
+The canonical model keeps three distinct concepts separate:
+
+- **Raw coordinate values** are the original decoded numbers and are available
+  through `Dataset::coordinate_values()` or `TimeSeriesView::coordinate_values()`.
+- A **physical time coordinate** exists only when the source establishes a
+  recognized time unit; inspect it with `coordinate_unit()`.
+- **Normalized seconds** are available from `TimeSeriesView::normalized_seconds()`
+  only for recognized time units. `Dataset::time_seconds()` performs the same
+  conversion but returns a structured unit error when it is unavailable.
+
+For headerless tables, the first numeric column may be inferred as the `Time`
+role while its source unit remains `Unit::Unknown`. Its numeric coordinates are
+still accessible; they are never silently treated as seconds.
 
 `Dataset::data` and `Dataset::column_by_role` remain available as Polars
 compatibility/advanced escape hatches, but are not required by ordinary callers.
@@ -163,6 +179,16 @@ let options = ReadOptions::new().with_sheet(SheetSelector::Name("Experiment 2".i
 let dataset = read_with_options("workbook.xlsx", &options)?;
 # Ok::<(), electrodata_io::Error>(())
 ```
+
+### XLSX preambles and table headers
+
+For workbook sheets, the reader examines a bounded preview for a semantic time
+header followed by consistently shaped numeric rows. This permits acquisition
+notes and blank rows before a normal table without relying on a fixed number of
+rows to skip. The rows before the discovered header are retained in
+`metadata.raw_rows`, and dataset row provenance remains the original worksheet
+row number. A sheet with no compatible semantic table header is rejected rather
+than guessed.
 
 ### XLSX error context
 
