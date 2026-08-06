@@ -34,6 +34,8 @@ pub struct Probe {
     pub container: ContainerFormat,
     /// Workbook member name.
     pub worksheet_name: Option<String>,
+    /// Zero-based workbook member index when this probe came from a worksheet.
+    pub worksheet_index: Option<usize>,
 }
 
 impl Probe {

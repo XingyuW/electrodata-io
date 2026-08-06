@@ -95,12 +95,13 @@ pub(crate) fn detect(
         .to_owned();
     let mut candidates = Vec::new();
     for (index, name) in selected_sheets {
-        let range = workbook
-            .worksheet_range(&name)
-            .map_err(|error| Error::Calamine {
+        let range = workbook.worksheet_range(&name).map_err(|error| {
+            Error::Calamine {
                 path: path.to_path_buf(),
                 source: Box::new(error),
-            })?;
+            }
+            .with_read_context_at(path, Some(&name), Some(index), None)
+        })?;
         if range.is_empty() {
             continue;
         }
@@ -117,6 +118,7 @@ pub(crate) fn detect(
             delimiter: None,
             container,
             worksheet_name: Some(name.clone()),
+            worksheet_index: Some(index),
         };
         if let Ok(mut result) = reader.detect_probe(path, &probe, options) {
             result.worksheet = probe.worksheet_name.clone();
@@ -182,20 +184,26 @@ pub(crate) fn read(
         .unwrap_or_default()
         .to_owned();
     let mut sheets = Vec::new();
+    let mut explicitly_selected_empty_sheet = None;
     for (index, name) in selected_sheets {
-        let range = workbook
-            .worksheet_range(&name)
-            .map_err(|error| Error::Calamine {
+        let range = workbook.worksheet_range(&name).map_err(|error| {
+            Error::Calamine {
                 path: path.to_path_buf(),
                 source: Box::new(error),
-            })?;
-        let formulas = workbook
-            .worksheet_formula(&name)
-            .map_err(|error| Error::Calamine {
+            }
+            .with_read_context_at(path, Some(&name), Some(index), None)
+        })?;
+        let formulas = workbook.worksheet_formula(&name).map_err(|error| {
+            Error::Calamine {
                 path: path.to_path_buf(),
                 source: Box::new(error),
-            })?;
+            }
+            .with_read_context_at(path, Some(&name), Some(index), None)
+        })?;
         if range.is_empty() {
+            if !matches!(options.sheet, SheetSelector::Auto) {
+                explicitly_selected_empty_sheet = Some((name, index));
+            }
             continue;
         }
         let rows: Vec<Vec<String>> = range
@@ -210,6 +218,7 @@ pub(crate) fn read(
             delimiter: None,
             container,
             worksheet_name: Some(name.clone()),
+            worksheet_index: Some(index),
         };
         sheets.push(SheetData {
             name,
@@ -226,6 +235,14 @@ pub(crate) fn read(
                 path: path.to_path_buf(),
             });
         }
+        if let Some((name, index)) = explicitly_selected_empty_sheet {
+            return Err(Error::EmptyData.with_read_context_at(
+                path,
+                Some(&name),
+                Some(index),
+                None,
+            ));
+        }
         return Err(Error::EmptyData.with_read_context(path, None, None));
     }
     let mut candidates = Vec::new();
@@ -236,26 +253,45 @@ pub(crate) fn read(
                 value: (sheet, handler, detection),
             }),
             Err(_) if matches!(options.sheet, SheetSelector::Auto) => continue,
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(error.with_read_context_at(
+                    path,
+                    Some(&sheet.name),
+                    Some(sheet.index),
+                    None,
+                ));
+            }
         }
     }
     let (sheet, handler, detection) =
         resolve_worksheet_candidates(path, &options.sheet, candidates)?;
-    reader.assemble(
-        path,
-        SourceData {
-            probe: sheet.probe,
-            rows: sheet.rows,
-            raw_rows: sheet.raw_rows,
-            diagnostics: Vec::new(),
-            encoding: None,
-            source_sha256,
-            formula_cells: sheet.formula_cells,
-        },
-        handler,
-        detection,
-        options,
-    )
+    let resolved_sheet_name = sheet.name.clone();
+    let resolved_sheet_index = sheet.index;
+    let resolved_format = detection.format.clone();
+    reader
+        .assemble(
+            path,
+            SourceData {
+                probe: sheet.probe,
+                rows: sheet.rows,
+                raw_rows: sheet.raw_rows,
+                diagnostics: Vec::new(),
+                encoding: None,
+                source_sha256,
+                formula_cells: sheet.formula_cells,
+            },
+            handler,
+            detection,
+            options,
+        )
+        .map_err(|error| {
+            error.with_read_context_at(
+                path,
+                Some(&resolved_sheet_name),
+                Some(resolved_sheet_index),
+                Some(resolved_format),
+            )
+        })
 }
 
 fn cell_text(cell: &Data) -> String {

@@ -62,6 +62,7 @@ pub(crate) fn open(path: &Path, probe_limit: usize, allow_lossy: bool) -> Result
         delimiter: Some(delimiter),
         container: ContainerFormat::Csv,
         worksheet_name: None,
+        worksheet_index: None,
     };
     Ok(CsvInput {
         probe,
@@ -126,6 +127,7 @@ pub(crate) fn probe(path: &Path, probe_limit: usize) -> Result<Probe> {
         delimiter: Some(delimiter),
         container: ContainerFormat::Csv,
         worksheet_name: None,
+        worksheet_index: None,
     })
 }
 

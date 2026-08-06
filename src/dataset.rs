@@ -6,6 +6,7 @@ use crate::{
     Result, Unit, UnitConversion, UnitErrorContext,
 };
 use polars::prelude::{Column as PolarsColumn, DataFrame};
+use std::path::Path;
 
 /// A scientific table and all information retained while reading it.
 #[derive(Debug, Clone)]
@@ -128,7 +129,7 @@ impl Dataset {
 
     /// Returns the unique canonical column with a semantic role.
     pub fn canonical_column(&self, role: &ColumnRole) -> Result<&Column> {
-        unique_by_role(&self.canonical_columns, role)
+        self.with_provenance_context(unique_by_role(&self.canonical_columns, role))
     }
 
     /// Null-aware numeric values without exposing Polars.
@@ -143,20 +144,22 @@ impl Dataset {
 
     /// Returns required values, failing with row/source-row context on the first null.
     pub fn required_f64_by_role(&self, role: &ColumnRole) -> Result<Vec<f64>> {
-        let column = self.column_index_by_role(role)?;
-        self.f64_values(role)?
-            .iter()
-            .enumerate()
-            .map(|(row, value)| {
-                value.ok_or_else(|| Error::MissingValue {
-                    path: self.metadata.provenance.path.clone().into(),
-                    role: role.clone(),
-                    row,
-                    source_row: self.source_row(row),
-                    column: Some(column + 1),
+        self.with_provenance_context((|| {
+            let column = self.column_index_by_role(role)?;
+            self.f64_values(role)?
+                .iter()
+                .enumerate()
+                .map(|(row, value)| {
+                    value.ok_or_else(|| Error::MissingValue {
+                        path: self.metadata.provenance.path.clone().into(),
+                        role: role.clone(),
+                        row,
+                        source_row: self.source_row(row),
+                        column: Some(column + 1),
+                    })
                 })
-            })
-            .collect()
+                .collect()
+        })())
     }
 
     /// Explicitly converts a numeric role to a requested compatible unit.
@@ -165,45 +168,47 @@ impl Dataset {
         role: &ColumnRole,
         target_unit: Unit,
     ) -> Result<ConvertedValues> {
-        let column_index = self.column_index_by_role(role)?;
-        let column = self.canonical_column(role)?;
-        let source_unit = column.unit.clone().unwrap_or(Unit::Unknown);
-        if source_unit == Unit::Unknown {
-            return Err(Error::UnknownUnit {
-                path: self.metadata.provenance.path.clone().into(),
-                role: role.clone(),
-                column: Some(column_index + 1),
-                details: Box::new(UnitErrorContext {
-                    source_header: column.original_name.clone(),
-                }),
-            });
-        }
-        let Some((scale, offset)) = conversion(&source_unit, &target_unit) else {
-            return Err(Error::IncompatibleUnit {
-                path: self.metadata.provenance.path.clone().into(),
-                role: role.clone(),
-                source_unit,
-                target_unit,
-                column: Some(column_index + 1),
-                details: Box::new(UnitErrorContext {
-                    source_header: column.original_name.clone(),
-                }),
-            });
-        };
-        Ok(ConvertedValues {
-            values: column
-                .values
-                .iter()
-                .map(|value| value.map(|value| value * scale + offset))
-                .collect(),
-            conversion: UnitConversion {
-                role: role.clone(),
-                source_unit,
-                target_unit,
-                scale,
-                offset,
-            },
-        })
+        self.with_provenance_context((|| {
+            let column_index = self.column_index_by_role(role)?;
+            let column = self.canonical_column(role)?;
+            let source_unit = column.unit.clone().unwrap_or(Unit::Unknown);
+            if source_unit == Unit::Unknown {
+                return Err(Error::UnknownUnit {
+                    path: self.metadata.provenance.path.clone().into(),
+                    role: role.clone(),
+                    column: Some(column_index + 1),
+                    details: Box::new(UnitErrorContext {
+                        source_header: column.original_name.clone(),
+                    }),
+                });
+            }
+            let Some((scale, offset)) = conversion(&source_unit, &target_unit) else {
+                return Err(Error::IncompatibleUnit {
+                    path: self.metadata.provenance.path.clone().into(),
+                    role: role.clone(),
+                    source_unit,
+                    target_unit,
+                    column: Some(column_index + 1),
+                    details: Box::new(UnitErrorContext {
+                        source_header: column.original_name.clone(),
+                    }),
+                });
+            };
+            Ok(ConvertedValues {
+                values: column
+                    .values
+                    .iter()
+                    .map(|value| value.map(|value| value * scale + offset))
+                    .collect(),
+                conversion: UnitConversion {
+                    role: role.clone(),
+                    source_unit,
+                    target_unit,
+                    scale,
+                    offset,
+                },
+            })
+        })())
     }
 
     /// Returns the time coordinate explicitly converted to seconds.
@@ -215,45 +220,50 @@ impl Dataset {
 
     /// Constructs a typed time-series view.
     pub fn time_series_view(&self) -> Result<TimeSeriesView<'_>> {
-        if self.kind() != DatasetKind::TimeSeries {
-            return Err(Error::WrongDatasetKind {
-                expected: DatasetKind::TimeSeries,
-                actual: self.kind(),
-            });
-        }
-        let converted = self.converted_f64_values(&ColumnRole::Time, Unit::Second)?;
-        Ok(TimeSeriesView {
-            time: self.canonical_column(&ColumnRole::Time)?,
-            time_seconds: converted.values,
-            time_conversion: converted.conversion,
-            measurements: self.measurement_channels(),
-            source_rows: &self.source_rows,
-        })
+        self.with_provenance_context((|| {
+            if self.kind() != DatasetKind::TimeSeries {
+                return Err(Error::WrongDatasetKind {
+                    expected: DatasetKind::TimeSeries,
+                    actual: self.kind(),
+                });
+            }
+            let converted = self.converted_f64_values(&ColumnRole::Time, Unit::Second)?;
+            Ok(TimeSeriesView {
+                time: self.canonical_column(&ColumnRole::Time)?,
+                time_seconds: converted.values,
+                time_conversion: converted.conversion,
+                measurements: self.measurement_channels(),
+                source_rows: &self.source_rows,
+            })
+        })())
     }
 
     /// Constructs a role-based EIS view. Optional measured fields are never synthesized in storage.
     pub fn eis_view(&self) -> Result<EisView<'_>> {
-        if self.kind() != DatasetKind::ImpedanceSpectrum {
-            return Err(Error::InvalidDatasetView {
-                path: self.metadata.provenance.path.clone().into(),
-                requested_view: "EisView".into(),
-                dataset_kind: self.kind(),
-            });
-        }
-        let frequency = self.required_column_in_unit(&ColumnRole::Frequency, Unit::Hertz)?;
-        let real = self.required_column_in_unit(&ColumnRole::ImpedanceReal, Unit::Ohm)?;
-        let imaginary = self.required_column_in_unit(&ColumnRole::ImpedanceImaginary, Unit::Ohm)?;
-        let measured_magnitude =
-            self.optional_column_in_unit(&ColumnRole::ImpedanceMagnitude, Unit::Ohm)?;
-        let measured_phase =
-            self.optional_column_in_unit(&ColumnRole::ImpedancePhase, Unit::Degree)?;
-        Ok(EisView {
-            frequency,
-            real,
-            imaginary,
-            measured_magnitude,
-            measured_phase,
-        })
+        self.with_provenance_context((|| {
+            if self.kind() != DatasetKind::ImpedanceSpectrum {
+                return Err(Error::InvalidDatasetView {
+                    path: self.metadata.provenance.path.clone().into(),
+                    requested_view: "EisView".into(),
+                    dataset_kind: self.kind(),
+                });
+            }
+            let frequency = self.required_column_in_unit(&ColumnRole::Frequency, Unit::Hertz)?;
+            let real = self.required_column_in_unit(&ColumnRole::ImpedanceReal, Unit::Ohm)?;
+            let imaginary =
+                self.required_column_in_unit(&ColumnRole::ImpedanceImaginary, Unit::Ohm)?;
+            let measured_magnitude =
+                self.optional_column_in_unit(&ColumnRole::ImpedanceMagnitude, Unit::Ohm)?;
+            let measured_phase =
+                self.optional_column_in_unit(&ColumnRole::ImpedancePhase, Unit::Degree)?;
+            Ok(EisView {
+                frequency,
+                real,
+                imaginary,
+                measured_magnitude,
+                measured_phase,
+            })
+        })())
     }
 
     /// All aligned non-coordinate time-series columns, including unknown roles.
@@ -371,7 +381,7 @@ impl Dataset {
             .enumerate()
             .filter_map(|(index, item)| (&item.role == role).then_some(index))
             .collect();
-        match indices.as_slice() {
+        self.with_provenance_context(match indices.as_slice() {
             [] => Err(Error::ColumnRoleNotFound(role.clone())),
             [index] => self
                 .data
@@ -381,7 +391,7 @@ impl Dataset {
                 role: role.clone(),
                 matches: indices.len(),
             }),
-        }
+        })
     }
 
     /// Compatibility accessor for a numbered measurement/potential channel.
@@ -472,6 +482,20 @@ impl Dataset {
             });
         }
         Ok(Some(column))
+    }
+
+    fn with_provenance_context<T>(&self, result: Result<T>) -> Result<T> {
+        if self.metadata.provenance.worksheet.is_none() {
+            return result;
+        }
+        result.map_err(|error| {
+            error.with_read_context_at(
+                Path::new(&self.metadata.provenance.path),
+                self.metadata.provenance.worksheet.as_deref(),
+                self.metadata.provenance.worksheet_index,
+                Some(self.format.clone()),
+            )
+        })
     }
 }
 

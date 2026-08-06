@@ -32,6 +32,8 @@ pub enum ErrorCategory {
 pub struct ErrorContext<'a> {
     pub path: Option<&'a Path>,
     pub worksheet: Option<&'a str>,
+    /// Zero-based workbook index for the resolved worksheet, when available.
+    pub worksheet_index: Option<usize>,
     pub format_candidate: Option<&'a FormatId>,
     pub row: Option<usize>,
     pub column: Option<usize>,
@@ -85,6 +87,7 @@ pub enum Error {
     ReadContext {
         path: PathBuf,
         worksheet: Option<String>,
+        worksheet_index: Option<usize>,
         format_candidate: Option<FormatId>,
         diagnostics: Vec<Diagnostic>,
         #[source]
@@ -314,6 +317,7 @@ impl Error {
         ErrorContext {
             path: self.path(),
             worksheet: self.worksheet(),
+            worksheet_index: self.worksheet_index(),
             format_candidate: self.format_candidate(),
             row: self.row(),
             column: self.column(),
@@ -459,6 +463,16 @@ impl Error {
         }
     }
 
+    /// Zero-based index for the resolved worksheet, when retained by context.
+    pub fn worksheet_index(&self) -> Option<usize> {
+        match self {
+            Self::ReadContext {
+                worksheet_index, ..
+            } => *worksheet_index,
+            _ => None,
+        }
+    }
+
     /// All compatible worksheets retained by an ambiguity error.
     pub fn worksheet_candidates(&self) -> Option<&[WorksheetCandidate]> {
         match self {
@@ -540,27 +554,72 @@ impl Error {
         worksheet: Option<&str>,
         format_candidate: Option<FormatId>,
     ) -> Self {
-        if self.path().is_some() {
-            self
-        } else {
-            Self::ReadContext {
-                path: path.to_path_buf(),
-                worksheet: worksheet.map(str::to_owned),
-                format_candidate,
-                diagnostics: Vec::new(),
-                source: Box::new(self),
-            }
+        self.with_read_context_at(path, worksheet, None, format_candidate)
+    }
+
+    /// Adds source context when it is absent, or when a resolved worksheet
+    /// would otherwise be lost by a path-bearing lower-level error.
+    pub(crate) fn with_read_context_at(
+        mut self,
+        path: &Path,
+        worksheet: Option<&str>,
+        worksheet_index: Option<usize>,
+        format_candidate: Option<FormatId>,
+    ) -> Self {
+        if let Self::ReadContext {
+            worksheet: current_worksheet,
+            worksheet_index: current_index,
+            ..
+        } = &mut self
+            && current_worksheet.as_deref() == worksheet
+            && current_index.is_none()
+            && worksheet_index.is_some()
+        {
+            *current_index = worksheet_index;
+            return self;
+        }
+        let has_matching_worksheet = self.worksheet() == worksheet
+            && (worksheet_index.is_none() || self.worksheet_index() == worksheet_index);
+        if self.path().is_some() && (worksheet.is_none() || has_matching_worksheet) {
+            return self;
+        }
+        Self::ReadContext {
+            path: path.to_path_buf(),
+            worksheet: worksheet.map(str::to_owned),
+            worksheet_index,
+            format_candidate,
+            diagnostics: Vec::new(),
+            source: Box::new(self),
         }
     }
 
     pub(crate) fn with_read_context_and_diagnostics(
-        mut self,
+        self,
         path: &Path,
         worksheet: Option<&str>,
         format_candidate: Option<FormatId>,
         diagnostics: Vec<Diagnostic>,
     ) -> Self {
-        if self.path().is_some() {
+        self.with_read_context_at_and_diagnostics(
+            path,
+            worksheet,
+            None,
+            format_candidate,
+            diagnostics,
+        )
+    }
+
+    pub(crate) fn with_read_context_at_and_diagnostics(
+        mut self,
+        path: &Path,
+        worksheet: Option<&str>,
+        worksheet_index: Option<usize>,
+        format_candidate: Option<FormatId>,
+        diagnostics: Vec<Diagnostic>,
+    ) -> Self {
+        let has_matching_worksheet = self.worksheet() == worksheet
+            && (worksheet_index.is_none() || self.worksheet_index() == worksheet_index);
+        if self.path().is_some() && (worksheet.is_none() || has_matching_worksheet) {
             if !diagnostics.is_empty() {
                 match &mut self {
                     Self::ReadContext {
@@ -615,6 +674,7 @@ impl Error {
         Self::ReadContext {
             path: path.to_path_buf(),
             worksheet: worksheet.map(str::to_owned),
+            worksheet_index,
             format_candidate,
             diagnostics,
             source: Box::new(self),

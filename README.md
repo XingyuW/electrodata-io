@@ -164,6 +164,19 @@ let dataset = read_with_options("workbook.xlsx", &options)?;
 # Ok::<(), electrodata_io::Error>(())
 ```
 
+### XLSX error context
+
+Worksheet selection failures (missing, ambiguous, or no compatible worksheet)
+occur before a singular worksheet has been resolved. Once an XLSX worksheet is
+resolved, every later content/parsing/validation failure is returned through
+the public `Error` API with the workbook path, worksheet name, and zero-based
+worksheet index where available. The original structured parser error remains
+the error source; callers can inspect `error.context()`, `error.worksheet()`,
+`error.worksheet_index()`, row/column accessors, and `error.source_error()`
+without decoding display text or diagnostics. Typed-view failures after
+`Dataset` creation use the worksheet provenance retained in the dataset and
+preserve the same context.
+
 Force a format or preserve source headers:
 
 ```rust,no_run

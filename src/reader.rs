@@ -1250,6 +1250,7 @@ fn parse_metadata(
             source_name: probe.source_name.clone(),
             container: probe.container,
             worksheet: probe.worksheet_name.clone(),
+            worksheet_index: probe.worksheet_index,
             delimiter: probe.delimiter.map(char::from),
             encoding,
             detected_format: detection.format.clone(),

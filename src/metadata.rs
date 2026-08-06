@@ -118,6 +118,8 @@ pub struct Provenance {
     pub container: ContainerFormat,
     /// Selected workbook sheet.
     pub worksheet: Option<String>,
+    /// Zero-based workbook index for the selected worksheet.
+    pub worksheet_index: Option<usize>,
     /// Detected delimiter for text sources.
     pub delimiter: Option<char>,
     /// Detected text encoding; workbook containers use `None`.
