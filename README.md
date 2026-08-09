@@ -11,6 +11,165 @@ The crate preserves source order, duplicate samples, numeric signs, raw
 metadata, and original headers. It never sorts, deduplicates, resamples,
 interpolates, corrects units, or replaces measured values with derived values.
 
+## Table of contents
+
+- [Project structure](#project-structure)
+  - [Repository map](#repository-map)
+  - [Crates, features, and dependencies](#crates-features-and-dependencies)
+  - [Runtime module dependency map](#runtime-module-dependency-map)
+  - [Public API and usage map](#public-api-and-usage-map)
+  - [Tests, fixtures, and docs](#tests-fixtures-and-docs)
+- [Basic use](#basic-use)
+  - [Time coordinates and units](#time-coordinates-and-units)
+- [Options](#options)
+  - [0.2 migration](#02-migration)
+  - [XLSX preambles and table headers](#xlsx-preambles-and-table-headers)
+  - [XLSX error context](#xlsx-error-context)
+- [Registering a format](#registering-a-format)
+- [Features](#features)
+- [Dependency](#dependency)
+- [Extended usage guide](#extended-usage-guide)
+  - [Requirements and dependency setup](#requirements-and-dependency-setup)
+  - [Reading and reusing a reader](#reading-and-reusing-a-reader)
+  - [Format-specific usage](#format-specific-usage)
+  - [Configuration patterns](#configuration-patterns)
+  - [Direct Polars and metadata access](#direct-polars-and-metadata-access)
+- [Validation and diagnostics](#validation-and-diagnostics)
+- [Excel worksheet selection](#excel-worksheet-selection)
+- [Feature selection](#feature-selection)
+- [Deploy or publish an application](#deploy-or-publish-an-application)
+- [Publish this crate](#publish-this-crate)
+- [Error handling](#error-handling)
+  - [Structured EIS failures](#structured-eis-failures)
+- [Development and verification](#development-and-verification)
+
+## Project structure
+
+This repository contains one library crate, `electrodata-io`, not a Cargo
+workspace. `src/lib.rs` is the public façade; the rest of `src/` is internal
+plumbing that is re-exported or consumed through that file.
+
+### Repository map
+
+```text
+electrodata-io/
+├── Cargo.toml
+├── README.md
+├── CHANGELOG.md
+├── src/
+│   ├── lib.rs               # public façade and re-exports
+│   ├── reader.rs            # read orchestration, decoding, workbook/CSV routing
+│   ├── dataset.rs           # canonical Dataset model and typed accessors
+│   ├── schema.rs            # roles, units, descriptors, schema helpers
+│   ├── options.rs           # read policies and validation configuration
+│   ├── metadata.rs          # acquisition, provenance, and raw metadata
+│   ├── diagnostics.rs       # non-fatal diagnostics and summaries
+│   ├── error.rs             # structured error model and context accessors
+│   ├── detection/
+│   │   ├── mod.rs           # detection results and selection thresholds
+│   │   └── normalize.rs     # text normalization used for matching
+│   ├── formats/
+│   │   ├── mod.rs           # format IDs, handler trait, shared helpers
+│   │   ├── regular_xy.rs    # generic table handler
+│   │   └── chi/
+│   │       └── mod.rs       # CHI OCPT, multichannel OCPT, and EIS handlers
+│   ├── source/
+│   │   ├── mod.rs           # container formats and bounded probe type
+│   │   ├── csv_source.rs    # CSV/text reading and probe generation
+│   │   └── excel.rs         # workbook probing, sheet selection, formula capture
+│   └── validation/
+│       └── mod.rs           # structural and scientific validation
+├── tests/
+│   ├── automatic_detection.rs
+│   ├── consumer_contract.rs
+│   ├── eis_structured_errors.rs
+│   ├── generated.rs
+│   ├── supplied_files.rs
+│   ├── table_parsing_remediation.rs
+│   ├── xlsx_error_context.rs
+│   ├── xlsx_preamble.rs
+│   ├── xlsx_worksheet_selection.rs
+│   └── fixtures/rust_electroanalysis_cli/
+├── docs/
+│   ├── consumer_contracts/
+│   └── reviews/
+└── LICENSE-MIT / LICENSE-APACHE
+```
+
+### Crates, features, and dependencies
+
+| Item | Purpose |
+| --- | --- |
+| `calamine` | workbook reader backend for `.xlsx`, `.xlsb`, and `.ods` containers; used for sheet enumeration, cell decoding, and formula capture |
+| `chrono` | parses CHI acquisition timestamps into `NaiveDateTime` and serializes them when `serde` is enabled |
+| `csv` | reads delimited text sources and decodes CSV/TSV records |
+| `polars` | provides the compatibility `DataFrame` and `Column` surfaces exposed by `Dataset::data` and `Dataset::column_by_role` |
+| `sha2` | computes the SHA-256 provenance digest for the physical source bytes |
+| `thiserror` | derives the structured `Error` type and stable display strings |
+| `serde` feature | serializes the public metadata, schema, diagnostics, and option types, and enables `chrono/serde` for retained timestamps |
+| `csv` feature | enables the `csv` crate and Polars CSV support for delimited text sources |
+| `excel` feature | enables workbook input through `calamine` |
+| `scientific-validation` feature | enables the optional non-mutating validation rules in `src/validation/mod.rs` |
+| `rust_xlsxwriter` (dev) | creates workbook fixtures for the integration tests |
+| `tempfile` (dev) | creates isolated temporary CSV/XLSX files in tests |
+| `toml` (dev) | reads the consumer-contract manifest fixture |
+
+### Runtime module dependency map
+
+| File / module | Depends on | Purpose and key items |
+| --- | --- | --- |
+| `src/lib.rs` | `reader`, `dataset`, `detection`, `diagnostics`, `error`, `formats`, `metadata`, `options`, `schema`, `source`, `validation` | public façade; re-exports the core public types and top-level helpers: `read`, `read_with_options`, `read_as`, `read_regular`, `read_chi_ocpt`, `read_chi_multichannel_ocpt`, `read_chi_eis`, and `detect_format` |
+| `src/reader.rs` | `source::*`, `formats::*`, `metadata::*`, `validation`, `dataset`, `diagnostics`, `error`, `options`, `schema` | `DataReader`, `DataReaderBuilder`, `SourceData`, `FormulaCell`; container dispatch, preview-driven detection, row decoding, metadata assembly, and validation orchestration |
+| `src/dataset.rs` | `schema`, `metadata`, `diagnostics`, `error`, `polars` | `Dataset`, `TimeSeriesView`, `EisView`; canonical column storage, typed accessors, unit conversion, role lookup, source-row tracking, and summary helpers |
+| `src/schema.rs` | standard library only plus optional `serde` | `DatasetKind`, `ColumnRole`, `Unit`, `ColumnDescriptor`, `DatasetSchema`, `Column`, `UnitConversion`, `ConvertedValues` |
+| `src/options.rs` | `formats::FormatId` plus optional `serde` | `ReadOptions`, `ReadProfile`, `HeaderPolicy`, `SheetSelector`, validation levels, and recovery policies |
+| `src/metadata.rs` | `source::ContainerFormat`, `schema::{ColumnRole, Unit}`, `options::ReadOptions`, `FormatId`, `chrono` | `Metadata`, `Provenance`, `AcquisitionMetadata`, `Parameter`, `RawMetadataRow`, `FormulaProvenance`, and source/workbook provenance capture |
+| `src/diagnostics.rs` | `schema::{ColumnRole, FormatId, ReadProfile}` plus optional `serde` | `Diagnostic`, `DiagnosticCode`, `Severity`, `RecoveryAction`, `DiagnosticSummary`, `ColumnMissingCount` |
+| `src/error.rs` | `formats::FormatId`, `diagnostics::Diagnostic`, `schema::DatasetKind`, `detection::DetectionResult`, `polars`, `calamine`, `thiserror` | `Error`, `ErrorCategory`, `ErrorContext`, `EisSchemaError`, `UnitErrorContext`, `WorksheetCandidate`; stable error inspection, read-context propagation, and workbook-specific failures |
+| `src/detection/mod.rs` | `formats`, `error`, `options`, `Path` | `ElectroDataFormat`, `DetectionResult`, `select`; format-level detection thresholds, confidence ordering, and ambiguity handling |
+| `src/detection/normalize.rs` | none internal | `normalize_for_match`; text normalization used only for detector matching |
+| `src/formats/mod.rs` | `chi`, `regular_xy`, `source::Probe`, `options::ReadOptions`, `schema::ColumnDescriptor` | `FormatId`, `DetectedLayout`, `Detection`, `FormatHandler`, `trim_cell`, `numeric` |
+| `src/formats/regular_xy.rs` | `detection::normalize_for_match`, `source::Probe`, `options`, `schema`, `HashMap` | `RegularXyHandler`, `FirstRowClassification`, `classify_first_row`, `header_role`, `eis_header_candidates`, `eis_schema_candidate`, `header_unit` |
+| `src/formats/chi/mod.rs` | `regular_xy` helpers, `detection::normalize_for_match`, `source::Probe`, `error`, `diagnostics`, `schema`, `options` | `ChiOcptHandler`, `ChiMultichannelOcptHandler`, `ChiEisHandler`, `validate_eis_schema`; CHI metadata parsing and EIS schema validation |
+| `src/source/mod.rs` | `sha2`, `csv_source`, `excel` | `ContainerFormat`, `Probe`, `sha256_hex` |
+| `src/source/csv_source.rs` | `source::{ContainerFormat, Probe}`, `diagnostics`, `error`, `csv` | `CsvInput`, `open`, `probe`; UTF-8 handling, delimiter detection, and line parsing |
+| `src/source/excel.rs` | `reader::{DataReader, FormulaCell, SourceData}`, `source::Probe`, `calamine`, `error` | `detect`, `read`, `SheetData`, `CompatibleWorksheet`, `resolve_worksheet_candidates`, `formula_cells`, `cell_text` |
+| `src/validation/mod.rs` | `dataset`, `diagnostics`, `options`, `error` | `validate`; structural checks, coordinate-order checks, and optional scientific validation |
+
+### Public API and usage map
+
+| API surface | Typical use |
+| --- | --- |
+| `detect_format(path)` | inspect the built-in format chosen from a bounded preview without loading the whole table |
+| `read(path)` | one-off read with automatic detection and default strict options |
+| `read_with_options(path, &ReadOptions)` | explicit header, sheet, validation, and recovery policy control |
+| `read_as(path, ElectroDataFormat)` | force a built-in scientific format without falling back to another one |
+| `read_regular`, `read_chi_ocpt`, `read_chi_multichannel_ocpt`, `read_chi_eis` | deterministic compatibility helpers for the built-in handlers |
+| `DataReader::builder()`, `with_builtin_formats()`, `register()`, `build()`, `read()`, `read_with_options()`, `detect_format()` | compose a reusable handler registry and reuse it for repeated reads, explicit options, or preview-only detection |
+| `Dataset` | canonical in-memory table plus compatibility `DataFrame` access; key methods include `kind`, `canonical_columns`, `canonical_column`, `f64_values`, `time_seconds`, `time_series_view`, `eis_view`, and `diagnostic_summary` |
+| `TimeSeriesView` / `EisView` | narrow the dataset to time-series or impedance-specific access patterns; use `coordinate_values`, `coordinate_unit`, `normalized_seconds`, `magnitude_values`, and `phase_values` |
+| `ReadOptions` | configure header policy, sheet selection, validation depth, and recovery behavior; builders include `new`, `compatibility`, `with_profile`, `with_format`, `with_header_policy`, `with_column_name_policy`, `with_sheet`, `with_validation`, and the recovery-policy setters |
+| `FormatHandler`, `FormatId`, `Detection`, `DetectedLayout` | register or inspect scientific-format implementations through `format_id`, `detect`, and `columns`, with structured evidence and layout metadata |
+| `Error`, `ErrorContext`, `Diagnostic`, `Provenance` | inspect structured failures, worksheet context, and retained source metadata through accessors such as `context`, `source_error`, `category`, `path`, `worksheet`, `row`, `column`, and `diagnostics` |
+| `ColumnRole`, `Unit`, `DatasetKind`, `ColumnDescriptor` | describe the semantic schema and units of each source column |
+
+### Tests, fixtures, and docs
+
+| Path | What it covers |
+| --- | --- |
+| `tests/automatic_detection.rs` | automatic detection, explicit readers, and equivalence between automatic and forced format selection |
+| `tests/consumer_contract.rs` | repository-level contract fixtures for the downstream consumer boundary |
+| `tests/eis_structured_errors.rs` | EIS schema failures, missing roles, and structured diagnostic context |
+| `tests/generated.rs` | generated regression coverage for row preservation, metadata, and compatibility behavior |
+| `tests/supplied_files.rs` | checked-in sample files and their preserved metadata/rows |
+| `tests/table_parsing_remediation.rs` | header inference, ragged rows, malformed values, and recovery diagnostics |
+| `tests/xlsx_error_context.rs` | workbook error propagation, sheet identity, and row/column context |
+| `tests/xlsx_preamble.rs` | workbook preambles and semantic header discovery |
+| `tests/xlsx_worksheet_selection.rs` | workbook ambiguity handling and explicit worksheet selection |
+| `tests/fixtures/rust_electroanalysis_cli/` | fixture CSV/XLSX/DAT inputs plus `expected.toml`, which drives the consumer contract |
+| `docs/consumer_contracts/rust_electroanalysis_cli.md` | the downstream boundary contract and semantic expectations |
+| `docs/reviews/` | historical review and remediation notes; not part of the runtime dependency graph |
+
 ## Basic use
 
 ```rust,no_run
