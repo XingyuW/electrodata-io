@@ -8,6 +8,9 @@ fn fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+// These are optional local supplied datasets. Mandatory committed coverage is
+// maintained in `tests/canonical_formats.rs`.
+
 fn value(dataset: &electrodata_io::Dataset, column: &str, row: usize) -> f64 {
     dataset
         .data
@@ -26,7 +29,7 @@ fn supplied_regular_file_is_preserved_as_present() {
     }
     let dataset = electrodata_io::read_regular(fixture("regular_file.csv")).unwrap();
     assert_eq!(dataset.format, FormatId::RegularXy);
-    // The checked-in fixture has one header plus 459,884 data rows; its final
+    // The optional local dataset has one header plus 459,884 data rows; its final
     // physical line has no trailing newline.
     assert_eq!(dataset.data.shape(), (459_884, 2));
     assert_eq!(dataset.data.get_column_names(), ["x", "y"]);

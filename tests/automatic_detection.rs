@@ -37,6 +37,8 @@ fn assert_equivalent(automatic: &electrodata_io::Dataset, explicit: &electrodata
 }
 
 #[test]
+// Optional local large-dataset coverage; committed canonical coverage is in
+// `tests/canonical_formats.rs`.
 fn supplied_fixtures_detect_and_dispatch_to_equivalent_readers() {
     if !fixture("regular_file.csv").exists() {
         return;
