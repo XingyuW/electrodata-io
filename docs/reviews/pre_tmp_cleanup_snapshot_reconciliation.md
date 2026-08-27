@@ -10,6 +10,9 @@ ancestry. The complete path/size/blob inventory is in
 [`pre_tmp_cleanup_snapshot_inventory.md`](pre_tmp_cleanup_snapshot_inventory.md).
 The exact snapshot-only and main-only path sets are in
 [`pre_tmp_cleanup_snapshot_path_comparison.md`](pre_tmp_cleanup_snapshot_path_comparison.md).
+The corresponding path sets against ending `main` (including the remediation
+artifacts added here) are in
+[`pre_tmp_cleanup_snapshot_final_path_comparison.md`](pre_tmp_cleanup_snapshot_final_path_comparison.md).
 
 ## Snapshot disposition matrix
 
