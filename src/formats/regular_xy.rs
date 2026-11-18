@@ -1,5 +1,6 @@
 use super::{DetectedLayout, Detection, FormatHandler, FormatId, numeric, trim_cell};
 use crate::detection::normalize_for_match;
+use crate::timestamp::{TimestampColumns, detected_columns, timestamp_columns};
 use crate::{
     ColumnDescriptor, ColumnRole, ContainerFormat, HeaderPolicy, Probe, ReadOptions, Unit,
 };
@@ -92,7 +93,8 @@ impl FormatHandler for RegularXyHandler {
                 .position(|(_, row)| {
                     row.len() >= 2
                         && matches!(classify_first_row(row), FirstRowClassification::Header(_))
-                        && matches!(header_role(&row[0]), ColumnRole::Time)
+                        && (matches!(header_role(&row[0]), ColumnRole::Time)
+                            || timestamps_after(&table_rows, row).is_some())
                         && numeric_rows_after(&table_rows, row, 1) > 0
                 })
                 // Preserve established header-at-first-row generic-table
@@ -130,19 +132,17 @@ impl FormatHandler for RegularXyHandler {
             .take(5)
             .map(|(_, row)| row)
             .collect();
+        let samples: Vec<&[String]> = candidate_rows.iter().map(|row| **row).collect();
+        let timestamps = has_header
+            .then(|| timestamp_columns(Some(first), &samples))
+            .flatten();
         let shaped_rows = candidate_rows
             .iter()
             .filter(|row| row.len() == width)
             .count();
         let numeric_rows = candidate_rows
             .iter()
-            .filter(|row| {
-                row.len() == width
-                    && row.iter().all(|cell| {
-                        let value = trim_cell(cell);
-                        value.is_empty() || missing_token(value) || numeric(value)
-                    })
-            })
+            .filter(|row| row.len() == width && data_row(row, timestamps))
             .count();
         if candidate_rows.is_empty() || shaped_rows == 0 || numeric_rows == 0 {
             return None;
@@ -202,6 +202,7 @@ impl FormatHandler for RegularXyHandler {
     ) -> crate::Result<Vec<ColumnDescriptor>> {
         let source = detection.layout.header_row.and_then(|row| probe.row(row));
         let width = detection.layout.expected_column_count;
+        let timestamps = detected_columns(&probe.rows, &detection.layout);
         let mut names = HashMap::<String, usize>::new();
         Ok((0..width)
             .map(|index| {
@@ -221,7 +222,19 @@ impl FormatHandler for RegularXyHandler {
                 let unit = source
                     .and_then(|_| header_unit(&source_name))
                     .unwrap_or(Unit::Unknown);
-                let base = if source.is_none() {
+                // A date-time column is read as elapsed seconds, whatever its
+                // heading suggests; text beside the coordinate is not data.
+                let (role, unit) = match timestamps {
+                    Some(columns) if columns.time == Some(index) => {
+                        (ColumnRole::Time, Unit::Second)
+                    }
+                    Some(columns) if columns.absorbed == Some(index) => {
+                        (ColumnRole::Date, Unit::Unknown)
+                    }
+                    _ => (role, unit),
+                };
+                let stamped_time = timestamps.is_some_and(|columns| columns.time == Some(index));
+                let base = if source.is_none() && !stamped_time {
                     format!("column_{}", index + 1)
                 } else {
                     canonical_name(&source_name, &role, &unit, index)
@@ -244,23 +257,45 @@ impl FormatHandler for RegularXyHandler {
     }
 }
 
+/// True when every cell outside the date-time columns is numeric or missing.
+fn data_row(row: &[String], timestamps: Option<TimestampColumns>) -> bool {
+    row.iter().enumerate().all(|(column, cell)| {
+        let value = trim_cell(cell);
+        value.is_empty()
+            || missing_token(value)
+            || numeric(value)
+            || timestamps.is_some_and(|columns| columns.contains(column))
+    })
+}
+
+fn rows_after<'a>(
+    table_rows: &'a [(usize, &'a [String])],
+    header: &[String],
+) -> impl Iterator<Item = &'a [String]> {
+    table_rows
+        .iter()
+        .skip_while(move |(_, row)| !std::ptr::eq(*row, header))
+        .skip(1)
+        .take(5)
+        .map(|(_, row)| *row)
+}
+
+fn timestamps_after(
+    table_rows: &[(usize, &[String])],
+    header: &[String],
+) -> Option<TimestampColumns> {
+    let samples: Vec<&[String]> = rows_after(table_rows, header).collect();
+    timestamp_columns(Some(header), &samples)
+}
+
 fn numeric_rows_after(
     table_rows: &[(usize, &[String])],
     header: &[String],
     minimum: usize,
 ) -> usize {
-    table_rows
-        .iter()
-        .skip_while(|(_, row)| !std::ptr::eq(*row, header))
-        .skip(1)
-        .take(5)
-        .filter(|(_, row)| {
-            row.len() == header.len()
-                && row.iter().all(|cell| {
-                    let value = trim_cell(cell);
-                    value.is_empty() || missing_token(value) || numeric(value)
-                })
-        })
+    let timestamps = timestamps_after(table_rows, header);
+    rows_after(table_rows, header)
+        .filter(|row| row.len() == header.len() && data_row(row, timestamps))
         .take(minimum)
         .count()
 }
@@ -397,6 +432,7 @@ fn canonical_name(source: &str, role: &ColumnRole, unit: &Unit, index: usize) ->
         ColumnRole::MeasurementChannel(channel) | ColumnRole::PotentialChannel(channel) => {
             unit_suffix(&format!("ch{channel}"), unit)
         }
+        ColumnRole::Date => "date".into(),
         ColumnRole::X => "x".into(),
         ColumnRole::Y => "y".into(),
         ColumnRole::Unknown | ColumnRole::Custom(_) => {

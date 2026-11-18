@@ -235,6 +235,35 @@ For headerless tables, the first numeric column may be inferred as the `Time`
 role while its source unit remains `Unit::Unknown`. Its numeric coordinates are
 still accessible; they are never silently treated as seconds.
 
+#### Date-time time columns
+
+A generic table or worksheet may give its time axis as date-times. The column
+is recognized from a time heading (`Time`, `Timestamp`, `DateTime`, `Date/Time`,
+or `Date` beside no other time column) and its values, and is stored as
+`Unit::Second`, measured from its first valid row.
+`Metadata::acquisition.time_origin` keeps that first timestamp.
+
+| Source form | Example | Notes |
+| --- | --- | --- |
+| Year-first | `2026-11-17T09:30:00.5+01:00`, `2026/11/17 09:30` | `Z` or a UTC offset is honored, so clock changes do not distort elapsed time |
+| Day-first | `17.11.2026 09:30:00`, `17-Nov-2026 09:30:00` | |
+| Numeric | `11/17/2026 9:30:00 AM`, `17/11/2026 09:30:00` | see below |
+| Time of day | `09:30:00` | seconds required; a fall of more than 12 h is taken as midnight |
+| Duration | `36:00:01` | any hour of 24 or more makes the column a duration |
+| Two columns | `Date` and `Time` | combined; the `Date` column gets `ColumnRole::Date` and is not a measurement |
+| Workbook cells | date, time and `[h]:mm:ss` formats | read to the millisecond |
+
+For `a/b/yyyy`, a field above 12 anywhere in the column settles the order.
+Otherwise `ReadOptions::with_date_order` must state it, except when every row has
+one date: elapsed time is then unaffected, and the calendar date is left
+unrecorded with a warning. A column that supports both orders, or contradicts the
+stated one, fails with `Error::AmbiguousDateOrder`. Two-digit years are not read.
+
+Rows that do not match the column's format follow `InvalidTimePolicy`. Timestamps
+without an offset are compared as written, so a daylight-saving change appears as
+a jump or as a `NonMonotonicTimestamp` diagnostic. If a numeric time column is
+also present it remains the coordinate.
+
 `Dataset::data` and `Dataset::column_by_role` remain available as Polars
 compatibility/advanced escape hatches, but are not required by ordinary callers.
 

@@ -1,9 +1,9 @@
-use crate::reader::{DataReader, FormulaCell, SourceData};
+use crate::reader::{DataReader, DateCell, FormulaCell, SourceData};
 use crate::source::{ContainerFormat, Probe};
 use crate::{
     Detection, DetectionResult, Error, ReadOptions, Result, SheetSelector, WorksheetCandidate,
 };
-use calamine::{Data, Reader, open_workbook_auto};
+use calamine::{Data, ExcelDateTime, Reader, open_workbook_auto};
 use std::path::Path;
 
 struct SheetData {
@@ -13,6 +13,7 @@ struct SheetData {
     raw_rows: Vec<String>,
     probe: Probe,
     formula_cells: Vec<FormulaCell>,
+    date_cells: Vec<DateCell>,
 }
 
 struct CompatibleWorksheet<T> {
@@ -227,6 +228,7 @@ pub(crate) fn read(
             raw_rows,
             probe,
             formula_cells: formula_cells(&range, &formulas),
+            date_cells: date_cells(&range),
         });
     }
     if sheets.is_empty() {
@@ -279,6 +281,7 @@ pub(crate) fn read(
                 encoding: None,
                 source_sha256,
                 formula_cells: sheet.formula_cells,
+                date_cells: sheet.date_cells,
             },
             handler,
             detection,
@@ -307,6 +310,60 @@ fn cell_text(cell: &Data) -> String {
     }
 }
 
+/// Date-formatted cells as timestamp text. Their stored serial numbers stay in
+/// the table, so a measurement cell that merely carries a date format keeps
+/// its value; only date-time coordinate columns use this text.
+fn date_cells(values: &calamine::Range<Data>) -> Vec<DateCell> {
+    values
+        .rows()
+        .enumerate()
+        .flat_map(|(row, cells)| {
+            cells
+                .iter()
+                .enumerate()
+                .filter_map(move |(column, cell)| match cell {
+                    Data::DateTime(value) => {
+                        date_cell_text(value).map(|text| DateCell { row, column, text })
+                    }
+                    _ => None,
+                })
+        })
+        .collect()
+}
+
+fn clock_text(milliseconds: i64) -> String {
+    let (seconds, milliseconds) = (milliseconds / 1000, milliseconds % 1000);
+    format!(
+        "{}:{:02}:{:02}.{milliseconds:03}",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
+
+fn date_cell_text(value: &ExcelDateTime) -> Option<String> {
+    // Spreadsheet date-times carry millisecond precision.
+    let milliseconds = (value.as_f64() * 86_400_000.0).round() as i64;
+    if milliseconds < 0 {
+        return None;
+    }
+    if value.is_duration() {
+        return Some(format!("+{}", clock_text(milliseconds)));
+    }
+    if value.as_f64() < 1.0 {
+        return Some(clock_text(milliseconds));
+    }
+    // A whole serial is a date without a time, so it can pair with a time column.
+    let pattern = if milliseconds % 86_400_000 == 0 {
+        "%Y-%m-%d"
+    } else {
+        "%Y-%m-%dT%H:%M:%S%.3f"
+    };
+    value
+        .as_datetime()
+        .map(|date_time| date_time.format(pattern).to_string())
+}
+
 fn formula_cells(
     values: &calamine::Range<Data>,
     formulas: &calamine::Range<String>,
@@ -321,7 +378,7 @@ fn formula_cells(
             let absolute = (start_row + row as u32, start_column + column as u32);
             let usable_numeric_cache = matches!(
                 values.get_value(absolute),
-                Some(Data::Int(_) | Data::Float(_))
+                Some(Data::Int(_) | Data::Float(_) | Data::DateTime(_) | Data::DateTimeIso(_))
             );
             FormulaCell {
                 row: absolute.0 as usize + 1,

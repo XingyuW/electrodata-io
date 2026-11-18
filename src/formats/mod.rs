@@ -13,7 +13,7 @@ pub(crate) use chi::{
     ChiEisHandler, ChiMultichannelOcptHandler, ChiOcptHandler, validate_eis_schema,
 };
 pub(crate) use regular_xy::{
-    FirstRowClassification, RegularXyHandler, classify_first_row, explicit_comment_row,
+    FirstRowClassification, RegularXyHandler, classify_first_row, explicit_comment_row, header_role,
 };
 
 /// Stable identifier for a scientific format, independent of storage.

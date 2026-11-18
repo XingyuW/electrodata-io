@@ -157,6 +157,8 @@ pub struct ReadOptions {
     pub ragged_row_policy: RaggedRowPolicy,
     /// Duplicate/nonmonotonic coordinate policy.
     pub coordinate_order_policy: CoordinateOrderPolicy,
+    /// Field order of numeric `a/b/yyyy` dates the column itself cannot settle.
+    pub date_order: Option<crate::DateOrder>,
 }
 
 impl Default for ReadOptions {
@@ -177,6 +179,7 @@ impl Default for ReadOptions {
             invalid_cell_policy: InvalidCellPolicy::Error,
             ragged_row_policy: RaggedRowPolicy::Error,
             coordinate_order_policy: CoordinateOrderPolicy::Error,
+            date_order: None,
         }
     }
 }
@@ -239,6 +242,12 @@ impl ReadOptions {
     pub fn with_coordinate_order_policy(mut self, policy: CoordinateOrderPolicy) -> Self {
         self.coordinate_order_policy = policy;
         self.synchronize_profile();
+        self
+    }
+
+    /// States the field order of numeric `a/b/yyyy` dates.
+    pub fn with_date_order(mut self, order: crate::DateOrder) -> Self {
+        self.date_order = Some(order);
         self
     }
 

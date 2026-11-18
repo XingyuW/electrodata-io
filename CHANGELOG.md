@@ -11,6 +11,14 @@ growth that cannot be represented safely by aliases alone.
 
 ### Added
 
+- Date-time time columns in generic tables and workbooks. ISO-8601 and
+  year-first dates, `dd.mm.yyyy`, `dd-Mon-yyyy`, numeric `a/b/yyyy` dates,
+  time-of-day and `h:mm:ss` duration columns, separate `Date` and `Time`
+  columns, and spreadsheet date, time and duration cells become seconds elapsed
+  since the first valid row. `AcquisitionMetadata::time_origin` keeps the
+  source timestamp at zero. Numeric dates are read only when the column settles
+  their order or `ReadOptions::date_order` states it; otherwise a multi-date
+  column fails with `Error::AmbiguousDateOrder`.
 - Canonical `DatasetSchema`, `DatasetKind`, and null-aware physical `Column`
   abstractions with typed time-series and EIS views.
 - General N-column time-series ingestion, semantic roles/units, headerless

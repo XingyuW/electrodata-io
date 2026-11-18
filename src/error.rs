@@ -229,6 +229,15 @@ pub enum Error {
         column: usize,
         diagnostics: Vec<Diagnostic>,
     },
+    #[error("cannot determine the date order at row {row}, column {column}: {message}")]
+    AmbiguousDateOrder {
+        path: PathBuf,
+        format_candidate: Option<FormatId>,
+        row: usize,
+        column: usize,
+        message: String,
+        diagnostics: Vec<Diagnostic>,
+    },
     #[error("unusable formula cache at row {row}, column {column} in worksheet {worksheet:?}")]
     UnusableFormula {
         path: PathBuf,
@@ -357,7 +366,9 @@ impl Error {
             | Self::MissingRequiredRole { .. }
             | Self::EisSchemaConflict { .. }
             | Self::EmptyData => ErrorCategory::Schema,
-            Self::MalformedNumeric { .. } => ErrorCategory::MalformedNumeric,
+            Self::MalformedNumeric { .. } | Self::AmbiguousDateOrder { .. } => {
+                ErrorCategory::MalformedNumeric
+            }
             Self::RaggedRow { .. } => ErrorCategory::RaggedRow,
             Self::MissingCoordinate { .. } | Self::MissingValue { .. } => {
                 ErrorCategory::MissingValue
@@ -401,6 +412,7 @@ impl Error {
             | Self::MissingRequiredRole { path, .. }
             | Self::DuplicateCoordinate { path, .. }
             | Self::NonMonotonicCoordinate { path, .. }
+            | Self::AmbiguousDateOrder { path, .. }
             | Self::UnusableFormula { path, .. }
             | Self::MissingValue { path, .. }
             | Self::UnknownUnit { path, .. }
@@ -440,6 +452,9 @@ impl Error {
                 format_candidate, ..
             }
             | Self::NonMonotonicCoordinate {
+                format_candidate, ..
+            }
+            | Self::AmbiguousDateOrder {
                 format_candidate, ..
             } => format_candidate.as_ref(),
             Self::UnusableFormula {
@@ -493,6 +508,7 @@ impl Error {
             | Self::MissingCoordinate { row, .. }
             | Self::DuplicateCoordinate { row, .. }
             | Self::NonMonotonicCoordinate { row, .. }
+            | Self::AmbiguousDateOrder { row, .. }
             | Self::UnusableFormula { row, .. }
             | Self::Metadata { row, .. }
             | Self::DelimitedText { row, .. } => Some(*row),
@@ -509,7 +525,8 @@ impl Error {
             Self::MalformedNumeric { column, .. }
             | Self::MissingCoordinate { column, .. }
             | Self::DuplicateCoordinate { column, .. }
-            | Self::NonMonotonicCoordinate { column, .. } => Some(*column),
+            | Self::NonMonotonicCoordinate { column, .. }
+            | Self::AmbiguousDateOrder { column, .. } => Some(*column),
             Self::UnusableFormula { column, .. } => Some(*column),
             Self::MissingValue { column, .. }
             | Self::UnknownUnit { column, .. }
@@ -541,7 +558,8 @@ impl Error {
             | Self::MissingCoordinate { diagnostics, .. }
             | Self::MissingRequiredRole { diagnostics, .. }
             | Self::DuplicateCoordinate { diagnostics, .. }
-            | Self::NonMonotonicCoordinate { diagnostics, .. } => diagnostics,
+            | Self::NonMonotonicCoordinate { diagnostics, .. }
+            | Self::AmbiguousDateOrder { diagnostics, .. } => diagnostics,
             Self::EisSchemaConflict { details } => &details.diagnostics,
             Self::UnusableFormula { diagnostics, .. } => diagnostics,
             _ => &[],
@@ -659,6 +677,10 @@ impl Error {
                         ..
                     }
                     | Self::NonMonotonicCoordinate {
+                        diagnostics: current,
+                        ..
+                    }
+                    | Self::AmbiguousDateOrder {
                         diagnostics: current,
                         ..
                     } => *current = diagnostics,

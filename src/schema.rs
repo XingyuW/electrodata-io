@@ -46,6 +46,8 @@ pub enum ColumnRole {
     MeasurementChannel(u32),
     /// Unresolved scientific role.
     Unknown,
+    /// Calendar text consumed by or standing beside the time coordinate.
+    Date,
     /// Legacy alias of [`ColumnRole::MeasurementChannel`].
     PotentialChannel(u32),
     /// Legacy alias of [`ColumnRole::ImpedancePhase`].
@@ -70,6 +72,7 @@ impl ColumnRole {
             Self::MeasurementChannel(_) | Self::PotentialChannel(_) => 10,
             Self::Unknown => 11,
             Self::Custom(_) => 12,
+            Self::Date => 13,
         }
     }
 }

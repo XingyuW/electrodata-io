@@ -300,6 +300,7 @@ impl Dataset {
                 !matches!(
                     column.role,
                     ColumnRole::Time
+                        | ColumnRole::Date
                         | ColumnRole::Frequency
                         | ColumnRole::ImpedanceReal
                         | ColumnRole::ImpedanceImaginary
@@ -320,6 +321,7 @@ impl Dataset {
     pub fn missing_value_count(&self) -> usize {
         self.canonical_columns
             .iter()
+            .filter(|column| column.role != ColumnRole::Date)
             .map(|column| column.values.iter().filter(|value| value.is_none()).count())
             .sum()
     }

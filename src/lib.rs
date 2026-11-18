@@ -14,6 +14,7 @@ mod options;
 mod reader;
 mod schema;
 mod source;
+mod timestamp;
 mod validation;
 
 pub use dataset::{Dataset, EisView, TimeSeriesView};
@@ -42,6 +43,7 @@ pub use schema::{
     UnitConversion,
 };
 pub use source::{ContainerFormat, Probe};
+pub use timestamp::{DateOrder, TimeOrigin, TimestampFormat};
 
 use std::path::Path;
 

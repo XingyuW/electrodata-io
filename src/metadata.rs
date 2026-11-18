@@ -25,6 +25,8 @@ pub struct AcquisitionMetadata {
     pub header: Option<String>,
     /// Note field.
     pub note: Option<String>,
+    /// Source timestamp at coordinate zero of a date-time time column.
+    pub time_origin: Option<crate::TimeOrigin>,
 }
 
 /// Parsed scalar metadata value.

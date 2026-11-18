@@ -64,6 +64,8 @@ pub enum DiagnosticCode {
     PhaseMismatch,
     UnusableFormula,
     EisSchema,
+    /// How a date-time coordinate column was read.
+    TimestampInterpretation,
 }
 
 impl PartialEq for DiagnosticCode {

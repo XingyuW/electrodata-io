@@ -11,6 +11,7 @@ use crate::metadata::{
 #[cfg(feature = "csv")]
 use crate::source::csv_source;
 use crate::source::{ContainerFormat, Probe};
+use crate::timestamp::{self, ResolvedTimestamps};
 use crate::validation;
 use crate::{
     ColumnNamePolicy, ColumnRole, CoordinateOrderPolicy, Dataset, DetectionResult, Diagnostic,
@@ -43,6 +44,15 @@ pub(crate) struct SourceData {
     pub encoding: Option<TextEncoding>,
     pub source_sha256: String,
     pub formula_cells: Vec<FormulaCell>,
+    pub date_cells: Vec<DateCell>,
+}
+
+/// A spreadsheet date cell: zero-based position in the table and timestamp text.
+#[derive(Debug, Clone)]
+pub(crate) struct DateCell {
+    pub row: usize,
+    pub column: usize,
+    pub text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -229,6 +239,7 @@ impl DataReader {
                     encoding: Some(input.encoding),
                     source_sha256: input.source_sha256,
                     formula_cells: Vec::new(),
+                    date_cells: Vec::new(),
                 },
                 handler,
                 detection,
@@ -246,14 +257,19 @@ impl DataReader {
         options: &ReadOptions,
     ) -> Result<Dataset> {
         let SourceData {
-            probe,
-            rows,
+            mut probe,
+            mut rows,
             raw_rows,
             diagnostics: source_diagnostics,
             encoding,
             source_sha256,
             formula_cells,
+            date_cells,
         } = source;
+        let regular_table = detection.format == crate::FormatId::RegularXy;
+        if regular_table {
+            apply_date_cells(&mut rows, &mut probe, &detection, &date_cells);
+        }
         if detection.format == crate::FormatId::ChiEis {
             crate::formats::validate_eis_schema(path, &probe, &detection, options)?;
         }
@@ -285,6 +301,44 @@ impl DataReader {
                 diagnostics,
             });
         }
+        let timestamps = regular_table
+            .then(|| timestamp::detected_columns(&rows, &detection.layout))
+            .flatten()
+            .map(|columns| timestamp::resolve(&rows, columns, &detection.layout, options))
+            .transpose()
+            .map_err(|conflict| {
+                Error::AmbiguousDateOrder {
+                    path: path.to_path_buf(),
+                    format_candidate: Some(detection.format.clone()),
+                    row: conflict.row_index + 1,
+                    column: conflict.column + 1,
+                    message: conflict.message,
+                    diagnostics: diagnostics.clone(),
+                }
+                .with_read_context(
+                    path,
+                    probe.worksheet_name.as_deref(),
+                    Some(detection.format.clone()),
+                )
+            })?;
+        if let Some(resolved) = &timestamps {
+            let column = resolved.columns.time.unwrap_or(0);
+            for note in &resolved.notes {
+                diagnostics.push(
+                    diagnostic(
+                        path,
+                        probe.worksheet_name.as_deref(),
+                        &detection.format,
+                        options,
+                        note.severity,
+                        DiagnosticCode::TimestampInterpretation,
+                        note.message.clone(),
+                    )
+                    .at(note.row_index + 1, Some(column + 1))
+                    .for_column(column_label(&descriptors, column)),
+                );
+            }
+        }
         let mut decoded = numeric_frame(
             &rows,
             DecodeContext {
@@ -295,6 +349,7 @@ impl DataReader {
                 options,
                 worksheet: probe.worksheet_name.as_deref(),
                 formula_cells: &formula_cells,
+                timestamps: timestamps.as_ref(),
             },
         )
         .map_err(|error| {
@@ -307,7 +362,7 @@ impl DataReader {
                 accrued,
             )
         })?;
-        let metadata = parse_metadata(
+        let mut metadata = parse_metadata(
             &rows,
             &raw_rows,
             MetadataContext {
@@ -321,6 +376,11 @@ impl DataReader {
                 source_sha256,
             },
         );
+        if let Some(origin) = timestamps.and_then(|resolved| resolved.origin) {
+            metadata.acquisition.recorded_at =
+                metadata.acquisition.recorded_at.or(origin.date_time);
+            metadata.acquisition.time_origin = Some(origin);
+        }
         diagnostics.append(&mut decoded.diagnostics);
         if !detection.layout.has_header {
             diagnostics.push(
@@ -380,6 +440,42 @@ impl DataReader {
         })?;
         dataset.diagnostics = diagnostics;
         Ok(dataset)
+    }
+}
+
+/// Replaces spreadsheet date serials with timestamp text in the columns that
+/// name a time or date, leaving every other column's stored number alone.
+fn apply_date_cells(
+    rows: &mut [Vec<String>],
+    probe: &mut Probe,
+    detection: &Detection,
+    date_cells: &[DateCell],
+) {
+    let header = detection
+        .layout
+        .header_row
+        .and_then(|row| rows.get(row))
+        .cloned();
+    let names_time = |column: usize| match &header {
+        Some(header) => header.get(column).is_some_and(|name| {
+            crate::formats::header_role(name) == ColumnRole::Time
+                || timestamp::date_time_header(name)
+                || crate::detection::normalize_for_match(name) == "date"
+        }),
+        None => column == 0,
+    };
+    for cell in date_cells {
+        if cell.row < detection.layout.data_start_row || !names_time(cell.column) {
+            continue;
+        }
+        for table in [&mut *rows, probe.rows.as_mut_slice()] {
+            if let Some(slot) = table
+                .get_mut(cell.row)
+                .and_then(|row| row.get_mut(cell.column))
+            {
+                slot.clone_from(&cell.text);
+            }
+        }
     }
 }
 
@@ -600,6 +696,7 @@ struct DecodeContext<'a> {
     options: &'a ReadOptions,
     worksheet: Option<&'a str>,
     formula_cells: &'a [FormulaCell],
+    timestamps: Option<&'a ResolvedTimestamps>,
 }
 
 fn numeric_frame(rows: &[Vec<String>], context: DecodeContext<'_>) -> Result<DecodedTable> {
@@ -611,6 +708,7 @@ fn numeric_frame(rows: &[Vec<String>], context: DecodeContext<'_>) -> Result<Dec
         options,
         worksheet,
         formula_cells,
+        timestamps,
     } = context;
     let expected = detection.layout.expected_column_count;
     let mut values: Vec<Vec<Option<f64>>> = (0..expected).map(|_| Vec::new()).collect();
@@ -701,6 +799,10 @@ fn numeric_frame(rows: &[Vec<String>], context: DecodeContext<'_>) -> Result<Dec
         let mut skip_row = false;
         for (column, cell) in cells.iter().enumerate() {
             let value = cell.trim();
+            if timestamps.is_some_and(|resolved| resolved.columns.absorbed == Some(column)) {
+                decoded_row.push(None);
+                continue;
+            }
             let coordinate = columns
                 .get(column)
                 .is_some_and(|descriptor| is_coordinate(&descriptor.role));
@@ -805,7 +907,11 @@ fn numeric_frame(rows: &[Vec<String>], context: DecodeContext<'_>) -> Result<Dec
             } else {
                 let parsed_result = value.parse::<f64>();
                 let parse_source = parsed_result.as_ref().err().cloned();
-                let parsed = parsed_result.ok().filter(|number| number.is_finite());
+                let parsed =
+                    match timestamps.filter(|resolved| resolved.columns.time == Some(column)) {
+                        Some(resolved) => resolved.seconds.get(&index).copied(),
+                        None => parsed_result.ok().filter(|number| number.is_finite()),
+                    };
                 if let Some(parsed) = parsed {
                     decoded_row.push(Some(parsed));
                 } else if coordinate {

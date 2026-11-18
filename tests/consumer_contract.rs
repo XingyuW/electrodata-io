@@ -281,6 +281,7 @@ fn diagnostic_code_name(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::PhaseMismatch => "PhaseMismatch",
         DiagnosticCode::UnusableFormula => "UnusableFormula",
         DiagnosticCode::EisSchema => "EisSchema",
+        DiagnosticCode::TimestampInterpretation => "TimestampInterpretation",
     }
 }
 
